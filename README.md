@@ -23,6 +23,51 @@ this README is produced by a harness in `bench/` that you can rerun.
 
 ---
 
+## The problem, in one story
+
+You have four things calling OpenAI: a meeting notes app, an n8n workflow, a
+customer chatbot, and a nightly batch job. All four hold a copy of the same API
+key, because that was the fastest thing to do at the time.
+
+On Tuesday the batch job gets stuck in a retry loop and spends $400 overnight.
+You find out when the invoice arrives. Nothing stopped it, because nothing was
+watching, and the provider dashboard shows you one number for all four, so you
+cannot even tell which one did it without going and adding logging to each.
+
+Put stormdoor in front and each of the four gets its own key with its own
+ceiling:
+
+```bash
+stormdoor keys create meeting-notes --budget 30 --rpm 120
+stormdoor keys create n8n-workflows --budget 10 --rpm 60
+stormdoor keys create support-chat  --budget 50 --rpm 300
+stormdoor keys create nightly-batch --budget 20 --rpm 30
+```
+
+Now the batch job hits its own $20 ceiling at 2am and starts getting 402s. The
+other three carry on, because a budget belongs to a key and not to the account.
+In the morning the ledger tells you which key, which model, how many tokens, and
+what each request cost.
+
+Inside the four apps, two lines changed: `base_url` and `api_key`. Everything
+else is the same, because stormdoor speaks the OpenAI API.
+
+### What this makes easy
+
+| Situation | Without a gateway | With stormdoor |
+|---|---|---|
+| One project runs away with your money | You find out from next month's invoice | It hits its own ceiling and stops. The rest keep working |
+| A key ends up in a git commit | Rotate the provider key, then update all four apps | Disable that one virtual key. The provider key never moved |
+| Someone asks what the chatbot costs | Export the invoice and estimate | One ledger query, per key, per model |
+| A contractor needs access for two weeks | Hand over the real key and hope | Mint a key with $5 and 10 rpm, disable it when they leave |
+| You want a model you have not used before | Another SDK, another key, another code path | Same endpoint, change the model string |
+| The provider has a bad hour | Find out from your users | Rehearse it first, on purpose, and know what your app does |
+
+That last row is the one this project is actually about. Everything above it,
+other gateways do too.
+
+---
+
 ## Run it in sixty seconds
 
 No Docker. No Postgres. No Redis. No API key.
@@ -102,6 +147,40 @@ X-Stormdoor-Chaos: fault=slow;delay_ms=800;p=0.25;seed=7
 
 Every injected fault is tagged in the ledger, so a drill is never confused with
 a real outage when you read the history back.
+
+### What a drill actually looks like
+
+It is Friday. You want to know what your chatbot does when the provider starts
+returning 503 to a quarter of your calls, without waiting for the day it
+happens. So you make it happen:
+
+```bash
+curl localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer sd-..." \
+  -H "X-Stormdoor-Chaos: fault=error;status=503;p=0.25" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"echo-small","messages":[{"role":"user","content":"hi"}]}'
+```
+
+Run your own traffic through that for ten minutes and you learn things you
+cannot learn from a feature list. Does the app retry, or show the user a stack
+trace? Does the retry have a backoff, or does it hammer a provider that is
+already struggling? Does anything alert, or does it fail silently? Does a failed
+call still get billed to the right key?
+
+Then the harder one, the failure most code has never been tested against: the
+provider accepts the request, streams half an answer, and dies.
+
+```bash
+-H "X-Stormdoor-Chaos: fault=mid_stream_abort;after_chunks=5"
+```
+
+The HTTP status was already 200 before anything went wrong, so a client that
+only checks status codes thinks this succeeded and shows the user half a
+sentence. stormdoor sends an SSE `error` event, records the request as
+`aborted` rather than as a success, and bills the tokens that really were
+produced. Your client's job is to notice. This is how you find out whether it
+does.
 
 ---
 
