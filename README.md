@@ -1,5 +1,9 @@
 # stormdoor
 
+[![CI](https://github.com/DINAKAR-S/stormdoor/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/DINAKAR-S/stormdoor/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+
 **An LLM gateway that proves itself under failure.**
 
 A storm door is the outer door that takes the weather so the real one does not.
