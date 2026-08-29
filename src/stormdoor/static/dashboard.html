@@ -1,0 +1,613 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>stormdoor</title>
+<!--
+  One file. No build step, no CDN, no framework. It is served by the gateway
+  itself and talks to the same admin API the CLI does, so there is nothing here
+  that you could not do with curl. That is deliberate: a dashboard that needs
+  its own toolchain is a second project.
+-->
+<style>
+  :root {
+    --ground:#F3F6F6; --surface:#FFFFFF; --surface-2:#EAF0F0;
+    --ink:#0F1618; --ink-2:#3E5158; --ink-3:#6C8189;
+    --line:#DCE4E5; --line-2:#C6D2D4;
+    --accent:#0B6E6B; --accent-soft:#DDEDEC;
+    --warn:#9A6212; --warn-soft:#F5EAD8;
+    --bad:#A03328; --bad-soft:#F7E4E1;
+    --void:#93A4AA;
+    --radius:6px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground:#0C1113; --surface:#141B1D; --surface-2:#1A2326;
+      --ink:#E9EFF0; --ink-2:#A7B8BD; --ink-3:#778B92;
+      --line:#253134; --line-2:#334347;
+      --accent:#4FC5BD; --accent-soft:#0F3130;
+      --warn:#E0A657; --warn-soft:#2C2314;
+      --bad:#E5836F; --bad-soft:#33201C;
+      --void:#5D6E74;
+    }
+  }
+  * { box-sizing:border-box; }
+  body {
+    margin:0; background:var(--ground); color:var(--ink);
+    font:15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .mono { font-family:ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  .wrap { max-width:1180px; margin:0 auto; padding:28px 24px 72px; }
+
+  h1 { font-size:1.5rem; font-weight:650; letter-spacing:-.02em; margin:0; }
+  h2 { font-size:.98rem; font-weight:600; margin:0; letter-spacing:-.005em; }
+  .sub { color:var(--ink-3); font-size:.85rem; }
+
+  header { display:flex; flex-wrap:wrap; gap:14px 20px; align-items:baseline;
+           padding-bottom:18px; border-bottom:1px solid var(--line); }
+  header .grow { flex:1; }
+
+  .pill { font-family:ui-monospace, monospace; font-size:.72rem; letter-spacing:.04em;
+          padding:3px 9px; border-radius:999px; background:var(--surface-2);
+          color:var(--ink-2); border:1px solid var(--line); white-space:nowrap; }
+  .pill.on   { background:var(--warn-soft); color:var(--warn); border-color:transparent; }
+  .pill.good { background:var(--accent-soft); color:var(--accent); border-color:transparent; }
+
+  /* Fixed columns, not auto-fit: eight tiles into an auto-fit grid leaves a
+     blank cell on the last row, which reads as a rendering bug. */
+  .tiles { display:grid; grid-template-columns:repeat(4,1fr);
+           gap:1px; background:var(--line); border:1px solid var(--line);
+           border-radius:var(--radius); overflow:hidden; margin:22px 0; }
+  @media (max-width:560px){ .tiles { grid-template-columns:repeat(2,1fr); } }
+  .tile { background:var(--surface); padding:15px 16px; }
+  .tile .n { font-size:1.6rem; font-weight:650; letter-spacing:-.03em; line-height:1.15;
+             font-variant-numeric:tabular-nums; }
+  .tile .k { font-size:.68rem; letter-spacing:.11em; text-transform:uppercase;
+             color:var(--ink-3); font-family:ui-monospace, monospace; }
+  .n.acc{color:var(--accent);} .n.warn{color:var(--warn);} .n.bad{color:var(--bad);}
+  .n.dim{color:var(--void);}
+
+  .cols { display:grid; grid-template-columns:1.35fr 1fr; gap:18px; align-items:start; }
+  @media (max-width:900px){ .cols { grid-template-columns:1fr; } }
+
+  .card { background:var(--surface); border:1px solid var(--line);
+          border-radius:var(--radius); overflow:hidden; margin-bottom:18px; }
+  .card > .head { display:flex; justify-content:space-between; align-items:center;
+                  gap:12px; padding:14px 16px; border-bottom:1px solid var(--line); }
+  .card > .body { padding:16px; }
+
+  table { width:100%; border-collapse:collapse; }
+  th { text-align:left; font-size:.67rem; letter-spacing:.1em; text-transform:uppercase;
+       color:var(--ink-3); font-family:ui-monospace, monospace; font-weight:600;
+       padding:9px 12px; background:var(--surface-2); border-bottom:1px solid var(--line-2);
+       white-space:nowrap; }
+  td { padding:10px 12px; border-bottom:1px solid var(--line); font-size:.86rem;
+       vertical-align:middle; }
+  tr:last-child td { border-bottom:0; }
+  td.num { text-align:right; font-variant-numeric:tabular-nums;
+           font-family:ui-monospace, monospace; }
+  .scroll { overflow-x:auto; }
+  /* The ledger grows without limit, so cap it and let it scroll in place
+     rather than pushing the rest of the page kilometres down. */
+  .scroll.tall { max-height:430px; overflow-y:auto; }
+  .scroll.tall thead th { position:sticky; top:0; z-index:1; }
+
+  .tag { display:inline-block; font-family:ui-monospace, monospace; font-size:.7rem;
+         padding:2px 7px; border-radius:4px; font-weight:500; }
+  .tag.ok      { background:var(--accent-soft); color:var(--accent); }
+  .tag.error   { background:var(--bad-soft); color:var(--bad); }
+  .tag.aborted { background:var(--warn-soft); color:var(--warn); }
+  .tag.refused { background:var(--surface-2); color:var(--ink-3); }
+  .tag.drill   { background:var(--warn-soft); color:var(--warn); }
+
+  .bar { height:5px; border-radius:3px; background:var(--line-2); overflow:hidden;
+         min-width:70px; margin-top:4px; }
+  .bar > span { display:block; height:100%; background:var(--accent); }
+  .bar.hot > span { background:var(--warn); }
+  .bar.full > span { background:var(--bad); }
+
+  label { display:block; font-size:.72rem; letter-spacing:.06em; text-transform:uppercase;
+          color:var(--ink-3); font-family:ui-monospace, monospace; margin-bottom:5px; }
+  input, select {
+    width:100%; padding:8px 10px; font:inherit; font-size:.88rem; color:var(--ink);
+    background:var(--ground); border:1px solid var(--line-2); border-radius:5px;
+  }
+  input:focus, select:focus { outline:2px solid var(--accent); outline-offset:1px;
+                              border-color:transparent; }
+  .row { display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr));
+         gap:12px; margin-bottom:12px; }
+  button {
+    font:inherit; font-size:.85rem; font-weight:550; padding:8px 14px; cursor:pointer;
+    border-radius:5px; border:1px solid var(--line-2); background:var(--surface-2);
+    color:var(--ink);
+  }
+  button:hover { border-color:var(--ink-3); }
+  button.primary { background:var(--accent); border-color:var(--accent); color:var(--ground); }
+  button.primary:hover { filter:brightness(1.08); }
+  button.link { background:none; border:none; padding:4px 6px; color:var(--accent);
+                text-decoration:underline; text-underline-offset:2px; font-size:.8rem; }
+  button:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+
+  .notice { padding:12px 14px; border-radius:5px; font-size:.86rem; margin-bottom:14px; }
+  .notice.secret { background:var(--accent-soft); color:var(--accent); }
+  .notice.err    { background:var(--bad-soft); color:var(--bad); }
+  .notice.warn   { background:var(--warn-soft); color:var(--warn); }
+  .notice .mono  { word-break:break-all; font-weight:600; }
+
+  .empty { padding:26px 16px; text-align:center; color:var(--ink-3); font-size:.86rem; }
+  .gate { max-width:440px; margin:80px auto; }
+  [hidden] { display:none !important; }
+</style>
+</head>
+<body>
+
+<!-- ── admin token gate ────────────────────────────────────────────────── -->
+<div class="wrap gate" id="gate" hidden>
+  <div class="card">
+    <div class="head"><h2>Admin token</h2></div>
+    <div class="body">
+      <p class="sub" style="margin:0 0 14px">
+        This is the token the gateway printed to its log at startup, or whatever you
+        set as <span class="mono">STORMDOOR_ADMIN_TOKEN</span>. It is kept in this
+        browser only and sent as a header, never in a URL.
+      </p>
+      <div id="gate-error" class="notice err" hidden></div>
+      <label for="token-input">Token</label>
+      <input id="token-input" type="password" class="mono" autocomplete="off">
+      <div style="margin-top:14px"><button class="primary" id="token-save">Unlock</button></div>
+    </div>
+  </div>
+</div>
+
+<!-- ── dashboard ───────────────────────────────────────────────────────── -->
+<div class="wrap" id="app" hidden>
+  <header>
+    <div>
+      <h1>stormdoor</h1>
+      <div class="sub">An LLM gateway that proves itself under failure.</div>
+    </div>
+    <div class="grow"></div>
+    <div id="status-pills" style="display:flex; gap:8px; flex-wrap:wrap"></div>
+    <button class="link" id="sign-out">Forget token</button>
+  </header>
+
+  <div class="tiles" id="tiles"></div>
+
+  <div class="cols">
+    <div>
+      <!-- keys -->
+      <div class="card">
+        <div class="head">
+          <div><h2>Keys</h2><div class="sub">What each one may do, and what it has spent</div></div>
+          <button id="new-key-toggle">New key</button>
+        </div>
+        <div class="body" id="new-key-panel" hidden>
+          <div id="secret-notice" class="notice secret" hidden></div>
+          <div class="row">
+            <div><label for="k-name">Name</label><input id="k-name" placeholder="mobile app"></div>
+            <div><label for="k-budget">Budget, USD</label><input id="k-budget" type="number" step="0.01" min="0" placeholder="none"></div>
+          </div>
+          <div class="row">
+            <div><label for="k-rpm">Requests / min</label><input id="k-rpm" type="number" min="1" placeholder="none"></div>
+            <div><label for="k-tpm">Tokens / min</label><input id="k-tpm" type="number" min="1" placeholder="none"></div>
+            <div><label for="k-models">Only these models</label><input id="k-models" placeholder="all models"></div>
+          </div>
+          <div id="key-error" class="notice err" hidden></div>
+          <button class="primary" id="k-create">Create key</button>
+        </div>
+        <div class="scroll">
+          <table>
+            <thead><tr>
+              <th>Name</th><th>Key</th><th>Budget</th><th class="num">Spent</th>
+              <th class="num">Limits</th><th></th>
+            </tr></thead>
+            <tbody id="keys-body"><tr><td colspan="6" class="empty">Loading</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- ledger -->
+      <div class="card">
+        <div class="head">
+          <div><h2>Ledger</h2><div class="sub">Every request, including the ones turned away</div></div>
+          <button id="pause">Pause</button>
+        </div>
+        <div class="scroll tall">
+          <table>
+            <thead><tr>
+              <th>When</th><th>Key</th><th>Model</th><th>Result</th>
+              <th class="num">Tokens</th><th class="num">Cost</th><th class="num">Latency</th>
+            </tr></thead>
+            <tbody id="ledger-body"><tr><td colspan="7" class="empty">Loading</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <!-- drill -->
+      <div class="card">
+        <div class="head">
+          <div><h2>Break it on purpose</h2>
+          <div class="sub">One real request, with a fault you choose</div></div>
+        </div>
+        <div class="body">
+          <div id="chaos-off" class="notice warn" hidden>
+            Fault injection is switched off, so faults below will be ignored. Restart with
+            <span class="mono">stormdoor serve --chaos</span> to arm it.
+          </div>
+          <div class="row">
+            <div><label for="d-key">Key</label><select id="d-key"></select></div>
+            <div><label for="d-model">Model</label><select id="d-model"></select></div>
+          </div>
+          <div class="row">
+            <div>
+              <label for="d-fault">Fault</label>
+              <select id="d-fault">
+                <option value="">None, just call it</option>
+                <option value="error">Provider returns an error</option>
+                <option value="mid_stream_abort">Dies half way through</option>
+                <option value="slow">Runs slow</option>
+              </select>
+            </div>
+            <div id="d-status-wrap" hidden>
+              <label for="d-status">Status code</label>
+              <select id="d-status">
+                <option>503</option><option>429</option><option>500</option><option>400</option>
+              </select>
+            </div>
+            <div id="d-after-wrap" hidden>
+              <label for="d-after">Die after N chunks</label>
+              <input id="d-after" type="number" min="1" value="4">
+            </div>
+            <div id="d-delay-wrap" hidden>
+              <label for="d-delay">Delay, ms</label>
+              <input id="d-delay" type="number" min="0" value="800">
+            </div>
+          </div>
+          <button class="primary" id="d-run">Send the request</button>
+          <div id="drill-out" style="margin-top:14px"></div>
+        </div>
+      </div>
+
+      <!-- latency -->
+      <div class="card">
+        <div class="head">
+          <div><h2>Recent latency</h2><div class="sub">Newest on the right</div></div>
+        </div>
+        <div class="body" id="spark"><div class="empty">No requests yet</div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+const TOKEN_KEY = "stormdoor.admin";
+const el = (id) => document.getElementById(id);
+let timer = null, paused = false, models = [], chaosArmed = false;
+
+// localStorage throws in some privacy modes, so never let it break the page.
+function readToken() { try { return localStorage.getItem(TOKEN_KEY) || ""; } catch { return ""; } }
+function writeToken(v) { try { v ? localStorage.setItem(TOKEN_KEY, v) : localStorage.removeItem(TOKEN_KEY); } catch {} }
+
+async function api(path, options = {}) {
+  const res = await fetch(path, {
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      "X-Stormdoor-Admin": readToken(),
+      ...(options.headers || {}),
+    },
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = new Error(body?.error?.message || `request failed with ${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
+  return body;
+}
+
+// Cents for anything you would put on an invoice, four places only when the
+// amount is genuinely sub-cent. "$0.0000" for zero reads like a broken field.
+const fmtMoney = (v) => {
+  const n = Number(v || 0);
+  return "$" + (n === 0 ? "0.00" : n >= 0.01 ? n.toFixed(2) : n.toFixed(4));
+};
+const fmtInt = (n) => Number(n || 0).toLocaleString();
+const fmtTime = (iso) => { const d = new Date(iso); return isNaN(d) ? iso : d.toLocaleTimeString(); };
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+// ── tiles and status ──────────────────────────────────────────────────────
+
+function renderStats(stats) {
+  const t = stats.totals;
+  chaosArmed = stats.chaos_enabled;
+  models = stats.models.map((m) => m.id);
+
+  el("status-pills").innerHTML = [
+    `<span class="pill good">${esc(stats.providers.join(" &middot; "))}</span>`,
+    `<span class="pill">limiter: ${esc(stats.limiter)}</span>`,
+    stats.chaos_enabled
+      ? `<span class="pill on">chaos armed</span>`
+      : `<span class="pill">chaos off</span>`,
+  ].join("");
+
+  const tiles = [
+    ["Requests", fmtInt(t.requests), ""],
+    ["Spent", fmtMoney(t.cost_usd), "acc"],
+    ["Answered", fmtInt(t.ok), "acc"],
+    ["Turned away", fmtInt(t.refused), "dim"],
+    ["Failed", fmtInt(t.errors), t.errors ? "bad" : "dim"],
+    ["Cut short", fmtInt(t.aborted), t.aborted ? "warn" : "dim"],
+    ["Drills run", fmtInt(t.drills), t.drills ? "warn" : "dim"],
+    ["Keys", `${fmtInt(t.keys_enabled)} / ${fmtInt(t.keys)}`, ""],
+  ];
+  el("tiles").innerHTML = tiles
+    .map(([k, n, cls]) => `<div class="tile"><div class="n ${cls}">${n}</div><div class="k">${k}</div></div>`)
+    .join("");
+
+  if (t.unpriced_requests > 0) {
+    el("tiles").insertAdjacentHTML("afterend",
+      `<div class="notice warn" id="unpriced">${fmtInt(t.unpriced_requests)} request(s) used a model with no
+       verified rate, so they were recorded at $0.00 and flagged rather than guessed at.
+       Set <span class="mono">STORMDOOR_PRICING_FILE</span> to price them.</div>`);
+  }
+  const stale = el("unpriced");
+  if (stale && t.unpriced_requests === 0) stale.remove();
+
+  el("chaos-off").hidden = stats.chaos_enabled;
+
+  const sel = el("d-model");
+  if (sel.options.length !== models.length) {
+    sel.innerHTML = models.map((m) => `<option>${esc(m)}</option>`).join("");
+  }
+}
+
+// ── keys ──────────────────────────────────────────────────────────────────
+
+function budgetCell(k) {
+  if (k.budget_usd === null) return `<span class="sub">no ceiling</span>`;
+  const used = Math.min(1, k.spent_usd / k.budget_usd);
+  const cls = used >= 1 ? "full" : used > 0.75 ? "hot" : "";
+  return `${fmtMoney(k.budget_usd)}
+    <div class="bar ${cls}"><span style="width:${(used * 100).toFixed(1)}%"></span></div>`;
+}
+
+function renderKeys(keys) {
+  if (!keys.length) {
+    el("keys-body").innerHTML = `<tr><td colspan="6" class="empty">
+      No keys yet. Create one above, or run <span class="mono">stormdoor keys create demo</span>.</td></tr>`;
+    el("d-key").innerHTML = "";
+    return;
+  }
+  el("keys-body").innerHTML = keys.map((k) => `
+    <tr>
+      <td>${esc(k.name)}${k.enabled ? "" : ` <span class="tag refused">off</span>`}</td>
+      <td class="mono sub">${esc(k.key_prefix)}…</td>
+      <td>${budgetCell(k)}</td>
+      <td class="num">${fmtMoney(k.spent_usd)}</td>
+      <td class="num sub">${k.rpm ? k.rpm + "/min" : "&mdash;"}${k.tpm ? "<br>" + fmtInt(k.tpm) + " tok" : ""}</td>
+      <td><button class="link" data-toggle="${esc(k.id)}" data-on="${k.enabled ? 1 : 0}">
+        ${k.enabled ? "Disable" : "Enable"}</button></td>
+    </tr>`).join("");
+
+  const sel = el("d-key");
+  const chosen = sel.value;
+  sel.innerHTML = keys.filter((k) => k.enabled)
+    .map((k) => `<option value="${esc(k.id)}">${esc(k.name)}</option>`).join("");
+  if (chosen) sel.value = chosen;
+}
+
+// ── ledger ────────────────────────────────────────────────────────────────
+
+function renderLedger(rows) {
+  if (!rows.length) {
+    el("ledger-body").innerHTML =
+      `<tr><td colspan="7" class="empty">Nothing has come through yet.</td></tr>`;
+    el("spark").innerHTML = `<div class="empty">No requests yet</div>`;
+    return;
+  }
+  el("ledger-body").innerHTML = rows.map((r) => `
+    <tr>
+      <td class="sub mono">${esc(fmtTime(r.ts))}</td>
+      <td>${esc(r.key_name)}</td>
+      <td class="mono" style="font-size:.8rem">${esc(r.model)}</td>
+      <td><span class="tag ${esc(r.status)}">${esc(r.status)}</span>
+          ${r.chaos_fault ? ` <span class="tag drill">drill</span>` : ""}
+          ${r.error_code ? `<div class="sub mono" style="font-size:.72rem">${esc(r.error_code)}</div>` : ""}</td>
+      <td class="num sub">${fmtInt(r.input_tokens)} / ${fmtInt(r.output_tokens)}</td>
+      <td class="num">${r.pricing_known ? fmtMoney(r.cost_usd) : `<span class="sub">unpriced</span>`}</td>
+      <td class="num sub">${r.latency_ms ?? "&mdash;"} ms${
+        r.ttft_ms != null ? `<div style="font-size:.72rem">${r.ttft_ms} to first</div>` : ""}</td>
+    </tr>`).join("");
+
+  renderSpark(rows.slice(0, 40).reverse());
+}
+
+function renderSpark(rows) {
+  const w = 320, h = 74, pad = 4;
+  const max = Math.max(...rows.map((r) => r.latency_ms || 0), 1);
+  const step = rows.length > 1 ? (w - pad * 2) / rows.length : w;
+  const colour = { ok: "var(--accent)", error: "var(--bad)",
+                   aborted: "var(--warn)", refused: "var(--void)" };
+  const bars = rows.map((r, i) => {
+    const bh = Math.max(2, ((r.latency_ms || 0) / max) * (h - pad * 2));
+    return `<rect x="${(pad + i * step).toFixed(1)}" y="${(h - pad - bh).toFixed(1)}"
+      width="${Math.max(1.5, step - 2).toFixed(1)}" height="${bh.toFixed(1)}" rx="1"
+      fill="${colour[r.status] || "var(--void)"}"><title>${esc(r.status)}, ${r.latency_ms} ms</title></rect>`;
+  }).join("");
+  el("spark").innerHTML =
+    `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}" role="img"
+      aria-label="Latency of the last ${rows.length} requests">${bars}</svg>
+     <div class="sub" style="margin-top:8px">Tallest bar is ${max} ms.
+     Colour is the outcome: teal answered, amber cut short, red failed, grey turned away.</div>`;
+}
+
+// ── drill ─────────────────────────────────────────────────────────────────
+
+function chaosSpec() {
+  const fault = el("d-fault").value;
+  if (!fault) return null;
+  if (fault === "error") return `fault=error;status=${el("d-status").value}`;
+  if (fault === "mid_stream_abort") return `fault=mid_stream_abort;after_chunks=${el("d-after").value}`;
+  return `fault=slow;delay_ms=${el("d-delay").value}`;
+}
+
+function syncDrillFields() {
+  const f = el("d-fault").value;
+  el("d-status-wrap").hidden = f !== "error";
+  el("d-after-wrap").hidden = f !== "mid_stream_abort";
+  el("d-delay-wrap").hidden = f !== "slow";
+}
+
+async function runDrill() {
+  const keyId = el("d-key").value;
+  const out = el("drill-out");
+  if (!keyId) { out.innerHTML = `<div class="notice err">Create a key first.</div>`; return; }
+
+  const fault = el("d-fault").value;
+  el("d-run").disabled = true;
+  out.innerHTML = `<div class="sub">Sending…</div>`;
+  try {
+    const res = await api("/admin/drill", {
+      method: "POST",
+      body: JSON.stringify({
+        key_id: keyId,
+        model: el("d-model").value,
+        chaos: chaosSpec(),
+        stream: fault === "mid_stream_abort",
+        max_tokens: 64,
+      }),
+    });
+    const kind = res.http_status === 200 && !res.detail ? "secret"
+               : res.http_status === 200 ? "warn" : "err";
+    const lines = [
+      `<strong>${esc(res.outcome)}</strong> &middot; HTTP ${res.http_status}`,
+      res.detail ? esc(res.detail.message) : "",
+      res.content_chunks_delivered != null
+        ? `${res.content_chunks_delivered} chunk(s) reached the caller before it stopped.` : "",
+      res.cost_usd != null ? `Cost ${fmtMoney(res.cost_usd)}.` : "",
+      res.latency_ms != null ? `Took ${res.latency_ms} ms.` : "",
+      `<span class="mono" style="font-size:.75rem">${esc(res.request_id)}</span>`,
+    ].filter(Boolean);
+    out.innerHTML = `<div class="notice ${kind}">${lines.join("<br>")}</div>`;
+    await refresh();
+  } catch (err) {
+    out.innerHTML = `<div class="notice err">${esc(err.message)}</div>`;
+  } finally {
+    el("d-run").disabled = false;
+  }
+}
+
+// ── refresh loop ──────────────────────────────────────────────────────────
+
+async function refresh() {
+  const [stats, keys, ledger] = await Promise.all([
+    api("/admin/stats"), api("/admin/keys"), api("/admin/ledger?limit=50"),
+  ]);
+  renderStats(stats);
+  renderKeys(keys.data);
+  renderLedger(ledger.data);
+}
+
+async function tick() {
+  if (paused) return;
+  try { await refresh(); }
+  catch (err) { if (err.status === 401) showGate("That token was not accepted."); }
+}
+
+function start() {
+  el("gate").hidden = true;
+  el("app").hidden = false;
+  tick();
+  clearInterval(timer);
+  timer = setInterval(tick, 4000);
+}
+
+function showGate(message) {
+  clearInterval(timer);
+  el("app").hidden = true;
+  el("gate").hidden = false;
+  el("gate-error").hidden = !message;
+  el("gate-error").textContent = message || "";
+}
+
+// ── wiring ────────────────────────────────────────────────────────────────
+
+el("token-save").addEventListener("click", async () => {
+  const value = el("token-input").value.trim();
+  if (!value) { el("gate-error").hidden = false; el("gate-error").textContent = "Enter the token first."; return; }
+  writeToken(value);
+  try { await refresh(); start(); }
+  catch (err) { writeToken(""); showGate(err.status === 401 ? "That token was not accepted." : err.message); }
+});
+el("token-input").addEventListener("keydown", (e) => { if (e.key === "Enter") el("token-save").click(); });
+
+el("sign-out").addEventListener("click", () => { writeToken(""); showGate(""); });
+
+el("pause").addEventListener("click", () => {
+  paused = !paused;
+  el("pause").textContent = paused ? "Resume" : "Pause";
+});
+
+el("new-key-toggle").addEventListener("click", () => {
+  el("new-key-panel").hidden = !el("new-key-panel").hidden;
+});
+
+el("k-create").addEventListener("click", async () => {
+  const name = el("k-name").value.trim();
+  const error = el("key-error");
+  if (!name) { error.hidden = false; error.textContent = "Give the key a name first."; return; }
+  error.hidden = true;
+
+  const num = (id) => { const v = el(id).value.trim(); return v === "" ? null : Number(v); };
+  try {
+    const res = await api("/admin/keys", {
+      method: "POST",
+      body: JSON.stringify({
+        name,
+        budget_usd: num("k-budget"),
+        rpm: num("k-rpm"),
+        tpm: num("k-tpm"),
+        allowed_models: el("k-models").value.split(",").map((s) => s.trim()).filter(Boolean),
+      }),
+    });
+    el("secret-notice").hidden = false;
+    el("secret-notice").innerHTML =
+      `Copy this now, it is not stored and cannot be shown again:<br>
+       <span class="mono">${esc(res.secret)}</span>`;
+    ["k-name", "k-budget", "k-rpm", "k-tpm", "k-models"].forEach((id) => (el(id).value = ""));
+    await refresh();
+  } catch (err) {
+    error.hidden = false;
+    error.textContent = err.message;
+  }
+});
+
+el("keys-body").addEventListener("click", async (e) => {
+  const btn = e.target.closest("[data-toggle]");
+  if (!btn) return;
+  const on = btn.dataset.on === "1";
+  await api(`/admin/keys/${btn.dataset.toggle}/${on ? "disable" : "enable"}`, { method: "POST" });
+  await refresh();
+});
+
+el("d-fault").addEventListener("change", syncDrillFields);
+el("d-run").addEventListener("click", runDrill);
+
+syncDrillFields();
+if (readToken()) {
+  refresh().then(start).catch((err) =>
+    showGate(err.status === 401 ? "That token was not accepted." : err.message));
+} else {
+  showGate("");
+}
+</script>
+</body>
+</html>

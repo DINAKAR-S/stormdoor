@@ -425,3 +425,62 @@ class Store:
 
     async def count_records(self, key_id: str, status: str | None = None) -> int:
         return await asyncio.to_thread(self._count_records, key_id, status)
+
+    # ── whole-gateway views, for the dashboard ───────────────────────────
+
+    def _recent_ledger(self, limit: int) -> list[dict]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                """SELECT u.ts, u.request_id, u.model, u.provider, u.status, u.error_code,
+                          u.input_tokens, u.output_tokens, u.cost_usd, u.pricing_known,
+                          u.latency_ms, u.ttft_ms, u.streamed, u.chaos_fault,
+                          k.name AS key_name, k.id AS key_id
+                   FROM usage_records u
+                   JOIN virtual_keys k ON k.id = u.key_id
+                   ORDER BY u.rowid DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    async def recent_ledger(self, limit: int = 50) -> list[dict]:
+        """The last N requests across every key, newest first."""
+        return await asyncio.to_thread(self._recent_ledger, limit)
+
+    def _totals(self) -> dict:
+        with self._conn() as conn:
+            usage = conn.execute(
+                """SELECT COUNT(*) AS requests,
+                          COALESCE(SUM(cost_usd), 0.0)      AS cost_usd,
+                          COALESCE(SUM(input_tokens), 0)    AS input_tokens,
+                          COALESCE(SUM(output_tokens), 0)   AS output_tokens,
+                          SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END)      AS ok,
+                          SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END)   AS errors,
+                          SUM(CASE WHEN status = 'aborted' THEN 1 ELSE 0 END) AS aborted,
+                          SUM(CASE WHEN status = 'refused' THEN 1 ELSE 0 END) AS refused,
+                          SUM(CASE WHEN chaos_fault IS NOT NULL THEN 1 ELSE 0 END) AS drills,
+                          SUM(CASE WHEN pricing_known = 0 THEN 1 ELSE 0 END)  AS unpriced
+                   FROM usage_records"""
+            ).fetchone()
+            keys = conn.execute(
+                """SELECT COUNT(*) AS total,
+                          SUM(CASE WHEN enabled = 1 THEN 1 ELSE 0 END) AS enabled
+                   FROM virtual_keys"""
+            ).fetchone()
+        return {
+            "requests": usage["requests"],
+            "ok": usage["ok"] or 0,
+            "errors": usage["errors"] or 0,
+            "aborted": usage["aborted"] or 0,
+            "refused": usage["refused"] or 0,
+            "drills": usage["drills"] or 0,
+            "unpriced_requests": usage["unpriced"] or 0,
+            "input_tokens": usage["input_tokens"],
+            "output_tokens": usage["output_tokens"],
+            "cost_usd": round(usage["cost_usd"], 6),
+            "keys": keys["total"],
+            "keys_enabled": keys["enabled"] or 0,
+        }
+
+    async def totals(self) -> dict:
+        """Gateway-wide counters for the dashboard tiles."""
+        return await asyncio.to_thread(self._totals)

@@ -14,12 +14,14 @@ to resume.
 
 from __future__ import annotations
 
+import json
 import logging
 import secrets
+from pathlib import Path
 
 from fastapi import Depends, FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .chaos import HEADER as CHAOS_HEADER
@@ -35,6 +37,9 @@ from .types import ChatCompletionRequest, RequestContext
 
 log = logging.getLogger("stormdoor")
 
+# One file, no build step, no CDN. It ships inside the wheel.
+DASHBOARD_HTML = Path(__file__).parent / "static" / "dashboard.html"
+
 
 # ── admin request bodies ─────────────────────────────────────────────────────
 
@@ -46,6 +51,23 @@ class CreateKeyBody(BaseModel):
     tpm: int | None = Field(default=None, ge=1)
     allowed_models: list[str] = Field(default_factory=list)
     expires_at: str | None = None
+
+
+class DrillBody(BaseModel):
+    """One request fired through the real path, on behalf of a key.
+
+    The dashboard needs a way to run a failure drill without the operator
+    holding a key's plaintext secret, which the gateway deliberately does not
+    keep. This runs the same admission, chaos and ledger code the public
+    endpoint runs, so what the dashboard shows is what a real caller would get.
+    """
+
+    key_id: str
+    model: str = "echo-small"
+    prompt: str = "hello from the drill"
+    chaos: str | None = None
+    stream: bool = False
+    max_tokens: int | None = 64
 
 
 # ── dependencies ─────────────────────────────────────────────────────────────
@@ -237,6 +259,112 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise BadRequest(f"no key with id {key_id!r}", param="key_id")
         summary = await store.usage_summary(key_id, limit=min(max(limit, 1), 500))
         return {"key": key.public(), **summary}
+
+    @app.get("/admin/ledger", dependencies=[Depends(_require_admin)])
+    async def ledger(limit: int = 50) -> dict:
+        return {"data": await store.recent_ledger(min(max(limit, 1), 500))}
+
+    @app.get("/admin/stats", dependencies=[Depends(_require_admin)])
+    async def stats() -> dict:
+        return {
+            "totals": await store.totals(),
+            "providers": registry.names(),
+            "models": registry.catalogue(),
+            "limiter": settings.limiter_backend,
+            "chaos_enabled": settings.chaos_enabled,
+        }
+
+    @app.post("/admin/drill", dependencies=[Depends(_require_admin)])
+    async def drill(body: DrillBody, gateway: Gateway = Depends(_gateway)) -> dict:
+        """Fire one request through the real path and report what happened."""
+        key = await store.key_by_id(body.key_id)
+        if key is None:
+            raise BadRequest(f"no key with id {body.key_id!r}", param="key_id")
+
+        req = ChatCompletionRequest(
+            model=body.model,
+            messages=[{"role": "user", "content": body.prompt}],
+            stream=body.stream,
+            max_tokens=body.max_tokens,
+        )
+        ctx = RequestContext()
+        chaos = ChaosGate(parse_spec(body.chaos), enabled=settings.chaos_enabled)
+
+        try:
+            admission = await gateway.admit(key, req)
+        except StormdoorError as err:
+            ctx.chaos_fault = chaos.label
+            await gateway.record_refusal(key, ctx, req, err)
+            return {
+                "outcome": "refused at the door",
+                "http_status": err.status_code,
+                "cost_usd": 0.0,
+                "detail": err.envelope()["error"],
+                "request_id": ctx.request_id,
+            }
+
+        if body.stream:
+            # Drain the same generator the public endpoint streams, then
+            # summarise it, so the dashboard can show that partial output
+            # reached the caller before the failure did.
+            chunks, error, done = 0, None, False
+            event: str | None = None
+            async for frame in gateway.stream(key, req, admission, chaos, ctx):
+                for line in frame.splitlines():
+                    if line.startswith("event: "):
+                        event = line[7:]
+                    elif line.startswith("data: "):
+                        payload = line[6:]
+                        if payload == "[DONE]":
+                            done = True
+                        elif event == "error":
+                            error = json.loads(payload)["error"]
+                        else:
+                            parsed = json.loads(payload)
+                            choices = parsed.get("choices") or []
+                            if choices and choices[0]["delta"].get("content"):
+                                chunks += 1
+                        event = None
+            return {
+                "outcome": "stream died part way" if error else "streamed to the end",
+                "http_status": 200,
+                "content_chunks_delivered": chunks,
+                "stream_closed_cleanly": done,
+                "detail": error,
+                "request_id": ctx.request_id,
+                "ttft_ms": ctx.ttft_ms,
+                "latency_ms": ctx.latency_ms,
+            }
+
+        try:
+            payload = await gateway.complete(key, req, admission, chaos, ctx)
+        except StormdoorError as err:
+            return {
+                "outcome": "the provider failed",
+                "http_status": err.status_code,
+                "cost_usd": 0.0,
+                "detail": err.envelope()["error"],
+                "request_id": ctx.request_id,
+            }
+        return {
+            "outcome": "answered",
+            "http_status": 200,
+            "cost_usd": payload["stormdoor"]["cost_usd"],
+            "latency_ms": payload["stormdoor"]["latency_ms"],
+            "content": payload["choices"][0]["message"]["content"],
+            "usage": payload["usage"],
+            "request_id": ctx.request_id,
+        }
+
+    # ── dashboard ────────────────────────────────────────────────────────
+
+    @app.get("/dashboard", include_in_schema=False)
+    async def dashboard() -> HTMLResponse:
+        return HTMLResponse(DASHBOARD_HTML.read_text(encoding="utf-8"))
+
+    @app.get("/", include_in_schema=False)
+    async def root() -> RedirectResponse:
+        return RedirectResponse("/dashboard")
 
     return app
 
