@@ -3,7 +3,7 @@
 The public surface is the OpenAI chat completions shape, because that is what
 existing clients already send. Internally each provider is reduced to two
 things: a ``Completion`` or a stream of ``TextDelta`` ending in ``StreamDone``.
-Keeping the internal shape this small is what lets week 2 fail over between
+Keeping the internal shape this small is what lets the gateway fail over between
 providers mid-stream without the client noticing.
 """
 

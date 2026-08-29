@@ -122,7 +122,7 @@ async def test_stream_emits_deltas_then_usage_then_done(client, auth):
 
 
 async def test_every_stream_frame_carries_an_event_id(client, auth):
-    """The anchor Last-Event-ID resume will need in week 4."""
+    """The anchor a Last-Event-ID resume will need."""
     ids: list[int] = []
     async with client.stream(
         "POST", "/v1/chat/completions", json=chat_body(stream=True), headers=auth

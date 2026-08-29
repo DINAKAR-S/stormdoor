@@ -72,7 +72,7 @@ async def test_error_fault_surfaces_as_the_chosen_status(client, auth):
     assert r.status_code == 503
     error = r.json()["error"]
     assert error["code"] == "chaos_injected"
-    assert error["retryable"] is True, "a 503 is worth retrying, and week 2 will"
+    assert error["retryable"] is True, "a 503 is worth retrying"
 
 
 async def test_a_429_fault_is_retryable_but_a_400_is_not(client, auth):

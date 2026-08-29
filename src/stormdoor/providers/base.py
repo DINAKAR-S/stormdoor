@@ -2,10 +2,10 @@
 
 Deliberately tiny. A provider turns a request into either one ``Completion`` or
 a stream of ``TextDelta`` ending in exactly one ``StreamDone``. Anything richer
-(tool calls, images, thinking blocks) is a later week's problem, and anything
+(tool calls, images, thinking blocks) comes later, and anything
 provider-specific rides through untouched in the request's extra fields.
 
-The narrowness is the feature. Week 2 has to abandon a failing provider
+The narrowness is the feature. Failover has to abandon a failing provider
 mid-response and continue on another one, and that is only tractable while the
 thing being resumed is a plain text stream with a token count at the end.
 """

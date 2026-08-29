@@ -104,7 +104,7 @@ class RateLimited(StormdoorError):
 
 
 class ProviderError(StormdoorError):
-    """An upstream failure, classified so week 2's router knows what to retry.
+    """An upstream failure, classified so the router knows what to retry.
 
     ``retryable`` is the field the fallback engine will read. Connection
     errors, timeouts, 408, 409, 429 and 5xx are retryable; a 400 or a 404 is

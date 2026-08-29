@@ -312,7 +312,7 @@ class Bench:
         result.note = (
             "Every failure is tagged in the ledger with the fault that caused it, so a "
             "rehearsal is never mistaken for a real outage when the history is read back. "
-            "The retryable flag is what week 2's fallback engine will act on."
+            "The retryable flag is what the routing layer acts on."
         )
         return result
 

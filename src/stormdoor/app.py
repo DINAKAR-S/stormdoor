@@ -8,8 +8,8 @@ tests without a socket in the way.
 Admission runs before a streaming response is returned, so a refusal is still a
 real HTTP status code (402, 403, 429) rather than an error event buried inside
 a 200 stream. Only failures that happen after the first byte have to be
-reported inside the stream, and those are exactly the ones week 4 has to learn
-to resume.
+reported inside the stream, and those are the ones a future resume feature has
+to learn to recover.
 """
 
 from __future__ import annotations

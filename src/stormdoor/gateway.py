@@ -283,7 +283,7 @@ class Gateway:
         """Yield raw SSE frames.
 
         Every frame carries an ``id:``. Nothing reads it yet; it is the anchor
-        week 4's ``Last-Event-ID`` resume needs, and adding it now costs a line
+        ``Last-Event-ID`` resume will need, and adding it now costs a line
         while retrofitting it later would change the wire format under clients.
 
         Once the first byte is out the HTTP status is already 200, so a failure

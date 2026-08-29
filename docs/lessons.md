@@ -1,6 +1,6 @@
 # What this build got wrong first
 
-An honest log of the defects found while building week 1, kept because the
+An honest log of the defects found while building the first release, kept because the
 interesting part is not that they were fixed but that the normal checks all
 passed while they were there.
 

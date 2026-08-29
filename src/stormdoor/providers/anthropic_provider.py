@@ -9,8 +9,8 @@ normalised here rather than being passed through and failing upstream with a
 400 the caller cannot act on.
 
 **Error classification.** Every failure is turned into a ``ProviderError``
-carrying an honest ``retryable`` flag. That flag is the input to week 2's
-fallback engine, so getting it wrong means either retrying a malformed request
+carrying an honest ``retryable`` flag. That flag is the input to the fallback
+engine, so getting it wrong means either retrying a malformed request
 forever or giving up on a transient overload. Connection failures, timeouts,
 408, 409, 429 and 5xx are retryable. A 400, 401, 403 or 404 is not: the request
 will fail the same way on every provider you send it to.
