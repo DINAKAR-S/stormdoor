@@ -232,6 +232,11 @@ async def test_a_failed_request_gives_its_reservation_back(priced_app, priced_cl
     assert refreshed.spent_usd == 0.0
     assert abs(refreshed.reserved_usd) < 1e-9
 
+    # Twenty consecutive failures opened the target's circuit, which is the
+    # right response to an outage. Cleared here because what this test is about
+    # is the budget, not the breaker.
+    priced_app.state.breaker.reset()
+
     # And the key is still usable afterwards, not silently exhausted.
     ok = await priced_client.post(
         "/v1/chat/completions", json=chat_body(max_tokens=8),

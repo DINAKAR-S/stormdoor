@@ -76,6 +76,8 @@ CREATE TABLE IF NOT EXISTS usage_records (
     ttft_ms             INTEGER,
     streamed            INTEGER NOT NULL DEFAULT 0,
     chaos_fault         TEXT,
+    attempts            INTEGER NOT NULL DEFAULT 1,
+    failed_over_from    TEXT,
     FOREIGN KEY (key_id) REFERENCES virtual_keys(id)
 );
 
@@ -242,6 +244,14 @@ class Store:
                 conn.execute(
                     "ALTER TABLE virtual_keys ADD COLUMN reserved_usd REAL NOT NULL DEFAULT 0.0"
                 )
+
+            usage_columns = {r["name"] for r in conn.execute("PRAGMA table_info(usage_records)")}
+            if "attempts" not in usage_columns:
+                conn.execute(
+                    "ALTER TABLE usage_records ADD COLUMN attempts INTEGER NOT NULL DEFAULT 1"
+                )
+            if "failed_over_from" not in usage_columns:
+                conn.execute("ALTER TABLE usage_records ADD COLUMN failed_over_from TEXT")
 
             # No request can be in flight at startup, so any reservation on disk
             # is a leak from a process that died mid-request. Clearing them here
@@ -466,6 +476,8 @@ class Store:
         streamed: bool,
         chaos_fault: str | None,
         reservation: float = 0.0,
+        attempts: int = 1,
+        failed_over_from: str | None = None,
     ) -> None:
         with self._conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -474,13 +486,15 @@ class Store:
                     """INSERT INTO usage_records
                        (id, key_id, request_id, ts, model, provider, input_tokens,
                         output_tokens, cached_input_tokens, cost_usd, pricing_known,
-                        status, error_code, latency_ms, ttft_ms, streamed, chaos_fault)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        status, error_code, latency_ms, ttft_ms, streamed, chaos_fault,
+                        attempts, failed_over_from)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         f"use_{uuid.uuid4().hex[:16]}", key_id, request_id, _now(),
                         model, provider, input_tokens, output_tokens, cached_input_tokens,
                         cost_usd, int(pricing_known), status, error_code,
                         latency_ms, ttft_ms, int(streamed), chaos_fault,
+                        attempts, failed_over_from,
                     ),
                 )
                 # Turning the reservation into real spend has to be one step.
@@ -521,7 +535,8 @@ class Store:
             ).fetchone()
             recent = conn.execute(
                 """SELECT ts, model, provider, status, error_code, input_tokens,
-                          output_tokens, cost_usd, latency_ms, ttft_ms, streamed, chaos_fault
+                          output_tokens, cost_usd, latency_ms, ttft_ms, streamed, chaos_fault,
+                          attempts, failed_over_from
                    FROM usage_records WHERE key_id = ?
                    ORDER BY ts DESC, rowid DESC LIMIT ?""",
                 (key_id, limit),
@@ -566,6 +581,7 @@ class Store:
         sql = """SELECT u.ts, u.request_id, u.model, u.provider, u.status, u.error_code,
                         u.input_tokens, u.output_tokens, u.cost_usd, u.pricing_known,
                         u.latency_ms, u.ttft_ms, u.streamed, u.chaos_fault,
+                        u.attempts, u.failed_over_from,
                         k.name AS key_name, k.id AS key_id
                  FROM usage_records u
                  JOIN virtual_keys k ON k.id = u.key_id"""
@@ -659,6 +675,8 @@ class Store:
                           SUM(CASE WHEN status = 'aborted' THEN 1 ELSE 0 END) AS aborted,
                           SUM(CASE WHEN status = 'refused' THEN 1 ELSE 0 END) AS refused,
                           SUM(CASE WHEN chaos_fault IS NOT NULL THEN 1 ELSE 0 END) AS drills,
+                          SUM(CASE WHEN failed_over_from IS NOT NULL THEN 1 ELSE 0 END)
+                                                               AS failed_over,
                           SUM(CASE WHEN pricing_known = 0 THEN 1 ELSE 0 END)  AS unpriced
                    FROM usage_records"""
             ).fetchone()
@@ -674,6 +692,7 @@ class Store:
             "aborted": usage["aborted"] or 0,
             "refused": usage["refused"] or 0,
             "drills": usage["drills"] or 0,
+            "failed_over": usage["failed_over"] or 0,
             "unpriced_requests": usage["unpriced"] or 0,
             "input_tokens": usage["input_tokens"],
             "output_tokens": usage["output_tokens"],

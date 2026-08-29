@@ -409,3 +409,29 @@ def test_an_explicit_token_wins_over_the_stored_one(tmp_path):
 async def test_the_sign_in_screen_says_where_to_find_the_token(client):
     html = (await client.get("/dashboard")).text
     assert "stormdoor admin-token" in html, "the gate must name the command that prints it"
+
+
+# ── the provider health panel ────────────────────────────────────────────────
+
+
+async def test_the_dashboard_ships_the_provider_health_panel(client):
+    html = (await client.get("/dashboard")).text
+    assert 'id="targets"' in html
+    assert "renderTargets" in html
+    assert 'id="reset-breakers"' in html
+    # A state name is jargon. The page has to say what it means for traffic.
+    assert "skipped, circuit open" in html
+
+
+async def test_health_is_empty_before_anything_is_called(client):
+    body = (await client.get("/admin/health", headers=ADMIN)).json()
+    assert body["targets"] == [], "silence is not a problem, it is silence"
+
+
+async def test_health_fills_in_from_real_traffic(client, auth):
+    await client.post("/v1/chat/completions", json=chat_body(), headers=auth)
+    body = (await client.get("/admin/health", headers=ADMIN)).json()
+
+    target = next(t for t in body["targets"] if t["target"] == "echo/echo-small")
+    assert target["state"] == "closed"
+    assert target["successes"] == 1

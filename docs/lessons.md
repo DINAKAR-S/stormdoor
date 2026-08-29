@@ -164,6 +164,60 @@ Once it was measured it was obviously worth fixing rather than documenting.
 
 ---
 
+## 11. A falsy zero is a timestamp you threw away
+
+The circuit breaker decided whether a cooldown had expired with
+``opened_at = health.opened_at or now``.
+
+``0.0`` is a legitimate timestamp and it is falsy, so a circuit opened at zero
+reset its own cooldown on every check and could never probe. It stayed open
+forever.
+
+In production this could not happen: ``time.monotonic()`` never returns zero in
+a real process. Which is exactly why it would have survived to production. It
+only appeared because the tests pass the clock in as an argument instead of
+reading it from the environment, and the first test that opened a circuit at
+``t=0`` failed immediately.
+
+> Make time an argument. A clock you cannot set is a branch you cannot test.
+
+---
+
+## 12. A feature flag that only half turns the feature off
+
+Failover could be disabled with a setting, and a drill measured what it was
+worth by running the same outage twice, once each way. The run with failover
+**off** succeeded 99% of the time. It was supposed to fail every request.
+
+The loop skipped any target whose circuit was open with ``continue``, which
+jumped straight past the check that was supposed to stop at the first target. So
+once the primary tripped its own breaker, requests quietly used the fallback
+anyway, with the feature switched off.
+
+The fix was to decide the list of targets once, up front, rather than filtering
+inside the loop. Nothing about the outcome looked wrong: requests succeeded, the
+ledger was consistent, no test failed. Only comparing a run against its own
+control showed it.
+
+> A control run is not ceremony. It is the only thing that can tell you a
+> feature did anything at all.
+
+---
+
+## 13. Shared state between measurements
+
+Adding the breaker made four unrelated drills fail at once: mid-stream aborts,
+budget admission, rate limiting. None of them had changed.
+
+The drills share one gateway, so the injected-outage drill left a circuit open
+and every later drill was measuring the breaker rather than the thing it was
+written to measure.
+
+> If two measurements share a process, they share everything in it. Reset
+> between them, or accept that you are measuring the order you ran them in.
+
+---
+
 ## The rule underneath all of these
 
 The test suite proves the code does what you thought of. Something else has to

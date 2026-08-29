@@ -25,6 +25,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
+from .breaker import BreakerConfig, CircuitBreaker
 from .chaos import HEADER as CHAOS_HEADER
 from .chaos import ChaosGate, parse_spec
 from .config import Settings, get_settings
@@ -33,6 +34,7 @@ from .gateway import Gateway
 from .limits import build_limiter
 from .pricing import PriceBook
 from .providers import build_registry
+from .routing import TIER_HEADER, RouteTable
 from .store import Store, VirtualKey
 from .types import ChatCompletionRequest, RequestContext
 
@@ -145,14 +147,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     limiter = build_limiter(settings.limiter_backend, settings.redis_url)
     registry = build_registry(settings)
     prices = PriceBook.load(settings.pricing_file)
+    routes = RouteTable.load(settings.routes_file)
+    breaker = CircuitBreaker(
+        BreakerConfig(
+            failure_threshold=settings.breaker_failure_threshold,
+            cooldown_s=settings.breaker_cooldown_s,
+        )
+    )
 
     app.state.settings = settings
     app.state.store = store
     app.state.limiter = limiter
     app.state.prices = prices
+    app.state.routes = routes
+    app.state.breaker = breaker
     app.state.gateway = Gateway(
-        settings=settings, store=store, limiter=limiter, registry=registry, prices=prices
+        settings=settings, store=store, limiter=limiter, registry=registry,
+        prices=prices, routes=routes, breaker=breaker,
     )
+
+    if routes.names():
+        log.info("routes loaded: %s", routes.names())
 
     if settings.chaos_enabled:
         log.warning(
@@ -195,6 +210,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "providers": registry.names(),
             "limiter": settings.limiter_backend,
             "chaos_enabled": settings.chaos_enabled,
+            "failover_enabled": settings.failover_enabled,
+            "routes": routes.names(),
         }
 
     @app.get("/v1/models")
@@ -217,7 +234,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
 
         try:
-            admission = await gateway.admit(key, body)
+            admission = await gateway.admit(
+                key, body, tier_hint=request.headers.get(TIER_HEADER)
+            )
         except StormdoorError as err:
             ctx.chaos_fault = chaos.label
             await gateway.record_refusal(key, ctx, body, err)
@@ -319,6 +338,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "limiter": settings.limiter_backend,
             "chaos_enabled": settings.chaos_enabled,
         }
+
+    @app.get("/admin/health", dependencies=[Depends(_require_admin)])
+    async def routing_health() -> dict:
+        """Circuit state per target, and the routes behind it.
+
+        Health comes from real traffic, so a target with no rows here has simply
+        not been used. Absence is not a problem, it is silence.
+        """
+        return {
+            "failover_enabled": settings.failover_enabled,
+            "max_retries": settings.max_retries,
+            "breaker": {
+                "failure_threshold": settings.breaker_failure_threshold,
+                "cooldown_s": settings.breaker_cooldown_s,
+            },
+            "targets": breaker.snapshot(),
+            "routes": routes.describe(),
+        }
+
+    @app.post("/admin/breaker/reset", dependencies=[Depends(_require_admin)])
+    async def reset_breaker(target: str | None = None) -> dict:
+        """Force a target back to closed, for when you know it recovered."""
+        breaker.reset(target)
+        return {"reset": target or "all targets"}
 
     @app.post("/admin/drill", dependencies=[Depends(_require_admin)])
     async def drill(body: DrillBody, gateway: Gateway = Depends(_gateway)) -> dict:

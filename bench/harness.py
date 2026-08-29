@@ -61,6 +61,11 @@ CHAOS_REQUESTS = 400
 CHAOS_RATE = 0.25
 ABORT_SAMPLES = 60
 ABORT_AFTER = 4
+FAILOVER_REQUESTS = 300
+
+# A fallback chain over the two local models, so the drill needs no API key.
+FAILOVER_ROUTES = {"resilient": {"targets": ["echo-small", "echo-large"]}}
+FAILOVER_PRIMARY = "echo/echo-small"
 
 
 def _free_port() -> int:
@@ -167,11 +172,24 @@ class Bench:
         await self.client.aclose()
         self.store.close()
 
+    def _isolate(self) -> None:
+        """Forget circuit state before a drill starts.
+
+        The drills share one gateway, so the injected-outage drill leaves the
+        echo target's circuit open and every later drill would then be measuring
+        the breaker rather than the thing it was written to measure. Found the
+        hard way: budget, rate limiting and mid-stream all failed at once after
+        failover landed, and none of them had changed.
+        """
+        self.app.state.breaker.reset()
+
     async def key(self, **kwargs) -> dict[str, str]:
+        self._isolate()
         _key, secret = await self.store.create_key(**kwargs)
         return {"Authorization": f"Bearer {secret}"}
 
     async def key_and_headers(self, **kwargs):
+        self._isolate()
         key, secret = await self.store.create_key(**kwargs)
         return key, {"Authorization": f"Bearer {secret}"}
 
@@ -458,6 +476,69 @@ class Bench:
         return result
 
 
+    # ── 7. what failover is worth ────────────────────────────────────────
+
+    async def failover(self, workdir: Path) -> Result:
+        """The same outage, twice: once with failover off, once with it on.
+
+        This is the only honest way to state what the feature is worth. A
+        success rate on its own says nothing, because it depends on how hard the
+        outage was. The difference between the two runs, under an outage of
+        exactly the same size, is the number.
+        """
+        routes = workdir / "routes.json"
+        routes.write_text(json.dumps(FAILOVER_ROUTES), encoding="utf-8")
+        outcomes = {}
+
+        for label, enabled in (("off", False), ("on", True)):
+            app = create_app(Settings(
+                db_path=workdir / f"failover-{label}.db",
+                admin_token="bench", chaos_enabled=True, routes_file=routes,
+                failover_enabled=enabled, max_retries=0, _env_file=None,
+            ))
+            _key, secret = await app.state.store.create_key(name=f"failover-{label}")
+            headers = {
+                "Authorization": f"Bearer {secret}",
+                # The primary is down. The secondary is fine. That is what an
+                # outage usually looks like, and it is the case failover exists
+                # for; a fault that hits every target equally has nowhere to go.
+                "X-Stormdoor-Chaos": f"fault=error;status=503;target={FAILOVER_PRIMARY}",
+            }
+            async with AsyncClient(transport=ASGITransport(app=app),
+                                   base_url="http://bench.local", timeout=60.0) as client:
+                codes = [
+                    (await client.post("/v1/chat/completions",
+                                       json=body(model="resilient", max_tokens=32),
+                                       headers=headers)).status_code
+                    for _ in range(FAILOVER_REQUESTS)
+                ]
+            outcomes[label] = codes
+            app.state.store.close()
+
+        rate = {k: v.count(200) / len(v) for k, v in outcomes.items()}
+
+        result = Result("An outage, with failover off and on")
+        result.add("Requests, each run", FAILOVER_REQUESTS)
+        result.add("Outage", "the first target in the chain returns 503 to everything")
+        for label in ("off", "on"):
+            result.add(
+                f"Succeeded with failover {label}",
+                f"{outcomes[label].count(200)} ({rate[label]:.1%})",
+            )
+        result.add("Difference", f"{(rate['on'] - rate['off']) * 100:.1f} points")
+        result.check("the outage reaches the caller when failover is off", rate["off"] == 0.0)
+        result.check("the caller never sees the outage when failover is on", rate["on"] == 1.0)
+        result.note = (
+            "Same injected outage both times, so the difference is the feature and not "
+            "the weather. With failover off every request fails, because the target it "
+            "was told to use is down. With it on the second target answers and the "
+            "caller is never told anything went wrong. After three consecutive failures "
+            "the first target's circuit opens and it stops being tried at all, so the "
+            "later requests do not even spend an attempt on it."
+        )
+        return result
+
+
 def render(results: list[Result]) -> str:
     lines: list[str] = []
     lines.append(
@@ -527,6 +608,7 @@ async def main() -> int:
                 await bench.mid_stream(),
                 await bench.budget(),
                 await bench.limits(),
+                await bench.failover(Path(tmp)),
             ]
 
     section = render(results)

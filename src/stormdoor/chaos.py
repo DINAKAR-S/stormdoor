@@ -25,9 +25,15 @@ Spec syntax, as a header or as ``STORMDOOR_CHAOS_DEFAULT``::
     X-Stormdoor-Chaos: fault=error;status=503;p=1.0
     X-Stormdoor-Chaos: fault=mid_stream_abort;after_chunks=5
     X-Stormdoor-Chaos: fault=slow;delay_ms=800;p=0.25;seed=7
+    X-Stormdoor-Chaos: fault=error;status=503;target=openai/gpt-4o-mini
 
 ``seed`` makes a probabilistic fault reproducible, which is what turns a demo
 into a regression test.
+
+``target`` limits the fault to one provider-and-model, which is what a real
+outage looks like. Without it a fault hits every target in a fallback chain
+equally, so the only outage you can rehearse is "everything is down" - the least
+interesting one, and the one where failover has nothing to fall back to.
 """
 
 from __future__ import annotations
@@ -54,6 +60,8 @@ class ChaosSpec:
     after_chunks: int = 3
     delay_ms: int = 1000
     seed: int | None = None
+    # Restrict the fault to one "provider/model". None means every target.
+    target: str | None = None
 
     @property
     def active(self) -> bool:
@@ -71,6 +79,8 @@ class ChaosSpec:
             bits.append(f"delay_ms={self.delay_ms}")
         if self.probability != 1.0:
             bits.append(f"p={self.probability}")
+        if self.target:
+            bits.append(f"target={self.target}")
         return ";".join(bits)
 
 
@@ -97,7 +107,7 @@ def parse_spec(raw: str | None) -> ChaosSpec:
         fields[key.strip().lower()] = value.strip()
 
     unknown = set(fields) - {"fault", "p", "probability", "status", "after_chunks",
-                             "delay_ms", "seed"}
+                             "delay_ms", "seed", "target"}
     if unknown:
         raise BadRequest(f"unknown chaos fields: {sorted(unknown)}", param="chaos")
 
@@ -129,6 +139,7 @@ def parse_spec(raw: str | None) -> ChaosSpec:
         after_chunks=_num("after_chunks", 3, int),
         delay_ms=_num("delay_ms", 1000, int),
         seed=_num("seed", None, int),
+        target=fields.get("target") or None,
     )
 
 
@@ -161,9 +172,23 @@ class ChaosGate:
     def label(self) -> str | None:
         return self.spec.describe() if self._fired else None
 
-    async def before_call(self) -> None:
+    def applies_to(self, target: str | None) -> bool:
+        """Is this fault meant for the target about to be called?
+
+        An unrestricted fault hits everything, which is what you want when
+        rehearsing a total outage. A restricted one hits a single
+        provider-and-model, which is what an outage usually is, and is the only
+        way to watch a fallback chain actually fall back.
+        """
+        if not self.spec.target:
+            return True
+        if target is None:
+            return False
+        return target == self.spec.target
+
+    async def before_call(self, target: str | None = None) -> None:
         """Run before the upstream request. May raise, hang, or delay."""
-        if not self._fired:
+        if not self._fired or not self.applies_to(target):
             return
         if self.spec.fault == "error":
             raise ChaosInjected(

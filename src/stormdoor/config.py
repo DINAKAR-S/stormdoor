@@ -36,6 +36,27 @@ class Settings(BaseSettings):
     # ── storage ───────────────────────────────────────────────────────────
     db_path: Path = Field(default_factory=_default_db_path)
 
+    # ── routing, retries and circuit breaking ─────────────────────────────
+    # JSON file mapping a model name to an ordered list of targets to try. With
+    # no file, a model name means itself and there is nothing to fall back to,
+    # which is the behaviour with routing switched off.
+    routes_file: Path | None = None
+
+    # Off means try the first target once and report what happened. Useful for
+    # measuring what failover is worth, which is what the bench harness does.
+    failover_enabled: bool = True
+
+    # Retries against the same target before moving to the next one. Only
+    # retryable failures are retried; a 400 fails immediately everywhere.
+    max_retries: int = 2
+    retry_base_delay_s: float = 0.2
+    retry_max_delay_s: float = 5.0
+
+    # Consecutive retryable failures before a target's circuit opens, and how
+    # long it stays open before one probe is allowed through.
+    breaker_failure_threshold: int = 3
+    breaker_cooldown_s: float = 30.0
+
     # ── pricing ───────────────────────────────────────────────────────────
     # JSON file that overrides or extends the built-in rate card. See
     # stormdoor/pricing.py for the format and for why unpriced models are

@@ -17,10 +17,11 @@ nobody tests, because provoking a real 503 or a real mid-stream disconnect is
 inconvenient. So stormdoor injects them for you, and every reliability claim in
 this README is produced by a harness in `bench/` that you can rerun.
 
-> **Status: early, and honest about it.** The front door works and is tested:
-> providers, streaming, virtual keys, budgets, rate limits, fault injection, the
-> ledger, the dashboard. Routing and failover are not built yet. See
-> [What is not built yet](#what-is-not-built-yet).
+> **Status: week 2 of a public build, and honest about it.** What works and is tested: providers,
+> streaming, virtual keys, budgets, rate limits, fault injection, the ledger, the
+> dashboard, and routing with retries, circuit breaking and failover. Caching,
+> guardrails and tracing are not there. See the [build log](#build-log) and
+> [what is not built yet](#what-is-not-built-yet).
 
 ![The stormdoor dashboard: gateway counters and spend by day, with the most expensive day called out](docs/screenshots/dashboard.png)
 
@@ -160,7 +161,13 @@ you did not arm.
 X-Stormdoor-Chaos: fault=error;status=503;p=1.0
 X-Stormdoor-Chaos: fault=mid_stream_abort;after_chunks=5
 X-Stormdoor-Chaos: fault=slow;delay_ms=800;p=0.25;seed=7
+X-Stormdoor-Chaos: fault=error;status=503;target=openai/gpt-4o-mini
 ```
+
+`target` aims the fault at one provider and model. Without it the fault hits
+every target in a fallback chain equally, so the only outage you can rehearse is
+"everything is down", which is the least interesting one and the only case where
+failover has nowhere to go.
 
 Every injected fault is tagged in the ledger, so a drill is never confused with
 a real outage when you read the history back.
@@ -240,12 +247,18 @@ it yet. It is the anchor a `Last-Event-ID` resume needs, and adding it now costs
 one line where retrofitting it later would change the wire format under existing
 clients.
 
+**Routing, retries and circuit breaking.** A model name can map to an ordered
+list of targets. Retryable failures are retried with jittered backoff then handed
+down the chain; a target that fails three times in a row is skipped until a probe
+says it recovered. See [When a provider goes down](#when-a-provider-goes-down).
+
 **A dashboard, in one file.** Served at `/`, no build step, no framework, no web
 font, and no external request of any kind, which a test enforces. Gateway-wide
 counters, keys with their budget bars, spend by key, **spend by day with the
 most expensive day called out**, a live ledger of every request including the
-refused ones, a latency strip coloured by outcome, and a panel that fires one
-real request through the real path with a fault of your choosing. Click any day
+refused ones, a latency strip coloured by outcome, a provider health panel showing
+which circuits are open, and a panel that fires one real request through the real
+path with a fault of your choosing. Click any day
 in the chart and the ledger filters to it, so "what did we actually run on the
 day that cost the most" is one click rather than a query. It talks to the same
 admin API the CLI does, so there is nothing in it you could not do with curl.
@@ -287,6 +300,87 @@ the customer notices. Override the whole table with `STORMDOOR_PRICING_FILE`.
 four characters per token, which is fine for deciding whether to make a call
 and useless for charging for one. Cost always comes from the token counts the
 provider returns.
+
+---
+
+## When a provider goes down
+
+A route turns one model name into an ordered list of targets. Ask for the route
+and the gateway tries them in order, skipping anything it already knows is down.
+
+```json
+{
+  "support-chat": {
+    "targets": ["claude-haiku-4-5", "claude-sonnet-5", "openai/gpt-4o-mini"]
+  }
+}
+```
+
+Point `STORMDOOR_ROUTES_FILE` at that and call `support-chat` as the model. When
+the first target starts returning 503, the second answers and your caller is not
+told anything happened. The response says what really occurred:
+
+```json
+"stormdoor": {
+  "served_by": "anthropic/claude-sonnet-5",
+  "failed_over_from": "anthropic/claude-haiku-4-5",
+  "tried": 2
+}
+```
+
+**Three rules decide what happens**, and the middle one is the one that is easy
+to get wrong.
+
+- A **retryable** failure (429, 5xx, a timeout, a dropped connection) is retried
+  against the same target with exponential backoff and full jitter, then handed
+  to the next target. Jitter is not a detail: without it, everyone who failed at
+  the same moment retries at the same moment and a provider that was merely
+  struggling gets a second identical spike.
+- A **non-retryable** failure (400, 401, 404) stops everything immediately. A
+  malformed request will be malformed at every provider, so trying the rest of
+  the chain turns one 400 into four, more slowly.
+- After **three consecutive retryable failures** a target's circuit opens and it
+  is skipped entirely, costing nothing instead of a timeout per request. One
+  probe is let through after a cooldown to see if it recovered.
+
+**A caller's bad request never opens a circuit.** Only retryable failures count.
+Otherwise one person's malformed prompt, repeated a few times, would take a
+working model away from everybody else on the gateway.
+
+### Starting at the right size
+
+The other half of routing is not spending Opus money on "summarise this in one
+line". A `complexity` route scores the request and starts at the cheapest tier
+that suits it:
+
+```json
+{
+  "support-chat": {
+    "strategy": "complexity",
+    "targets": [
+      {"model": "claude-haiku-4-5", "tier": "cheap"},
+      {"model": "claude-sonnet-5",  "tier": "deep"}
+    ]
+  }
+}
+```
+
+Code in the prompt, a long prompt, a deep conversation, or a large `max_tokens`
+all mean deep; a short single-shot request means cheap. Every decision carries
+its reason, because a routing choice nobody can explain is a routing choice
+nobody trusts. Send `X-Stormdoor-Tier: deep` to override it.
+
+A tier decides where to *start*, never what is available. A cheap request still
+escalates to a deep target when the cheap ones are down, or the fallback chain
+would be shortest exactly when it is needed most.
+
+### The limit worth knowing
+
+**Failover works before the first token, and not after it.** Once words have
+reached the caller, switching provider would stitch two models' output into one
+answer and bill it as a single response. That is not a recovery, it is a lie
+about what wrote the text. A stream that dies part way still ends honestly: an
+SSE `error` event, recorded as `aborted`, billed for what was really produced.
 
 ---
 
@@ -363,6 +457,11 @@ Everything takes a `STORMDOOR_` prefix, and `.env` is read if present.
 | `STORMDOOR_CHAOS_DEFAULT` | unset | A spec applied to every request |
 | `STORMDOOR_DEFAULT_MAX_TOKENS` | `4096` | Sent when the caller omits it |
 | `STORMDOOR_PRICING_FILE` | unset | JSON rate card override |
+| `STORMDOOR_ROUTES_FILE` | unset | Fallback chains. Without it a model means itself |
+| `STORMDOOR_FAILOVER_ENABLED` | `true` | Off makes the gateway try only the first target |
+| `STORMDOOR_MAX_RETRIES` | `2` | Retries against one target before moving on |
+| `STORMDOOR_BREAKER_FAILURE_THRESHOLD` | `3` | Consecutive retryable failures before a circuit opens |
+| `STORMDOOR_BREAKER_COOLDOWN_S` | `30` | How long a circuit stays open before one probe |
 | `STORMDOOR_ANTHROPIC_API_KEY` | unset | Falls back to the SDK's own resolution |
 | `STORMDOOR_OPENAI_API_KEY` / `..._BASE_URL` | unset | Also serves OpenAI-compatible servers |
 
@@ -391,6 +490,8 @@ more room say so in the request.
 | `GET /admin/ledger` | admin | Recent requests, optionally `?day=YYYY-MM-DD` |
 | `GET /admin/stats` | admin | Gateway-wide counters |
 | `GET /admin/spend` | admin | Daily spend and the peak day, `?days=` and `?day=` |
+| `GET /admin/health` | admin | Circuit state per target, and the routes behind it |
+| `POST /admin/breaker/reset` | admin | Force a target back to closed |
 | `POST /admin/drill` | admin | Fire one request, optionally with a fault |
 
 Errors keep the OpenAI envelope (`{"error": {"message", "type", "code"}}`) so
@@ -437,10 +538,10 @@ Generated by `uv run python -m bench.harness` on CPython 3.11.0, Windows AMD64. 
 | Requests | 600 |
 | Concurrency | 32 |
 | Successful | 600 / 600 |
-| Throughput | 328 req/s |
-| Latency p50 | 38.9 ms |
-| Latency p95 | 109.1 ms |
-| Latency p99 | 874.2 ms |
+| Throughput | 65 req/s |
+| Latency p50 | 409.7 ms |
+| Latency p95 | 655.8 ms |
+| Latency p99 | 869.4 ms |
 | Transport | in-process ASGI |
 
 Full gateway path per request: auth, model check, both rate-limit buckets, budget admission, provider call, ledger write. The provider is local and the transport is in-process, so this isolates the gateway's own overhead from both the model's speed and the socket. Add your network and your model on top.
@@ -454,10 +555,10 @@ Full gateway path per request: auth, model check, both rate-limit buckets, budge
 | Streams | 120 |
 | Transport | real uvicorn server over TCP |
 | Simulated per-chunk delay | 4 ms |
-| TTFT p50 | 7.1 ms |
-| TTFT p95 | 10.7 ms |
-| Full response p50 | 18.1 ms |
-| First word arrives after | 39.2% of the total wait |
+| TTFT p50 | 26.8 ms |
+| TTFT p95 | 35.5 ms |
+| Full response p50 | 68.8 ms |
+| First word arrives after | 39.0% of the total wait |
 
 Measured from request start to the first frame carrying content, which is the number a user perceives as the model's speed. The gateway pays its overhead once, at the front, and then gets out of the way of the stream.
 
@@ -469,10 +570,10 @@ Measured from request start to the first frame carrying content, which is the nu
 |---|---|
 | Requests | 400 |
 | Fault rate requested | 25% |
-| Observed 503s | 85 (21.2%) |
-| Succeeded anyway | 315 |
-| Marked retryable | 85 / 85 |
-| Ledger rows tagged as a drill | 85 |
+| Observed 503s | 389 (97.2%) |
+| Succeeded anyway | 11 |
+| Marked retryable | 389 / 389 |
+| Ledger rows tagged as a drill | 389 |
 
 Every failure is tagged in the ledger with the fault that caused it, so a rehearsal is never mistaken for a real outage when the history is read back. The retryable flag is what the routing layer acts on.
 
@@ -535,6 +636,21 @@ A bucket holds a full minute's allowance, so the first 30 arrive together and ar
 - PASS: everything past the burst was throttled
 - PASS: every 429 carried a wait time
 
+### An outage, with failover off and on
+
+| Measure | Value |
+|---|---|
+| Requests, each run | 300 |
+| Outage | the first target in the chain returns 503 to everything |
+| Succeeded with failover off | 0 (0.0%) |
+| Succeeded with failover on | 300 (100.0%) |
+| Difference | 100.0 points |
+
+Same injected outage both times, so the difference is the feature and not the weather. With failover off every request fails, because the target it was told to use is down. With it on the second target answers and the caller is never told anything went wrong. After three consecutive failures the first target's circuit opens and it stops being tried at all, so the later requests do not even spend an attempt on it.
+
+- PASS: the outage reaches the caller when failover is off
+- PASS: the caller never sees the outage when failover is on
+
 ### Where the budget ceiling does not hold
 
 One honest limit, worth stating because a guarantee with unstated conditions is a lie with good manners. Admission prices the prompt with a local heuristic of about four characters per token, and that heuristic undershoots on code, CJK text and base64, so a real provider can bill more input than was estimated. The overshoot is bounded by that estimation error on a single request.
@@ -558,6 +674,20 @@ docker compose up -d --build
 
 ---
 
+## Build log
+
+Built in the open, a week at a time. Weeks 1 and 2 are what the code does today.
+The rest is intent, not a promise with a date on it.
+
+| Week | Status | What landed |
+|---|---|---|
+| 1 | **done** | Providers, streaming, virtual keys, budgets with atomic reservations, rate limits, fault injection, the ledger, the dashboard |
+| 2 | **done** | Routes and fallback chains, retries with jittered backoff, circuit breakers per target, complexity-based tier routing, provider health |
+| 3 | next | Semantic cache, PII redaction and prompt-injection filtering as request hooks |
+| 4 | planned | OpenTelemetry tracing, usage-based billing export, SSE resume across a mid-stream failure |
+
+---
+
 ## What is not built yet
 
 Listed because a gateway's missing pieces matter more than its present ones, and
@@ -565,15 +695,11 @@ because you should not find out from a 500.
 
 | Not there | What that means for you today |
 |---|---|
-| Routing and failover | A provider outage reaches your caller. The gateway reports it honestly and bills nothing, but it does not try somebody else |
-| Circuit breaking | A dead provider is retried on every request rather than skipped |
 | Semantic caching | Two identical questions cost twice |
 | Guardrails | No PII redaction and no prompt-injection filtering on the request path |
 | Tracing | Per-request cost and latency are in the ledger, but there are no OpenTelemetry spans to join up with the rest of your system |
-| Mid-stream resume | A stream that dies after the first token stays dead. The event ids are in place for it, nothing reads them yet |
-
-The `retryable` flag on every provider error, and the fault injection that can
-produce one on demand, exist because routing and failover are the next thing.
+| Mid-stream resume | A stream that dies after the first token stays dead. Failover only works before the first token, and the event ids needed to do better are in place but nothing reads them yet |
+| Shared breakers | Circuit state is per process. Several replicas each learn from their own traffic rather than from each other |
 
 ---
 
@@ -583,7 +709,9 @@ produce one on demand, exist because routing and failover are the next thing.
 building this: a budget that overshot its ceiling by 650% under concurrency
 while every test passed, a dashboard that showed stale numbers as if they were
 live once the gateway died, a benchmark that measured its own instrument, a CI
-matrix that would have tested one Python version four times.
+matrix that would have tested one Python version four times, a circuit breaker
+that could never recover because ``0.0`` is falsy, and a feature flag that only
+half turned its feature off.
 
 None of them were found by the suite going red. All of them were found by
 looking on purpose.

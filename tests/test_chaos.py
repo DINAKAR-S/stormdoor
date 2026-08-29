@@ -75,13 +75,18 @@ async def test_error_fault_surfaces_as_the_chosen_status(client, auth):
     assert error["retryable"] is True, "a 503 is worth retrying"
 
 
-async def test_a_429_fault_is_retryable_but_a_400_is_not(client, auth):
+async def test_a_429_fault_is_retryable_but_a_400_is_not(client, app, auth):
     """The retryable flag is what the fallback engine reads, so it has to be honest."""
     too_many = await client.post(
         "/v1/chat/completions", json=chat_body(),
         headers={**auth, **chaos("fault=error;status=429")},
     )
     assert too_many.json()["error"]["retryable"] is True
+
+    # That 429 was retried and therefore tripped the target's circuit, which is
+    # correct and is asserted in its own test below. Cleared here so the next
+    # request actually reaches a provider instead of being skipped.
+    app.state.breaker.reset()
 
     bad = await client.post(
         "/v1/chat/completions", json=chat_body(),

@@ -162,6 +162,16 @@
   .dayaxis { display:flex; justify-content:space-between; margin-top:8px;
              font-family:var(--mono); font-size:.68rem; color:var(--ink-3); }
 
+  /* ── provider health ──────────────────────────────────── */
+  .targets { display:flex; flex-direction:column; gap:12px; }
+  .target { display:grid; grid-template-columns:1fr auto; gap:4px 12px; align-items:baseline; }
+  .target .who { font-family:var(--mono); font-size:.82rem; word-break:break-all; }
+  .target .meta { grid-column:1 / -1; font-size:.7rem; color:var(--ink-3);
+                  font-family:var(--mono); }
+  .tag.closed { background:var(--ok-bg); color:var(--ok); }
+  .tag.open { background:var(--bad-bg); color:var(--bad); }
+  .tag.half_open { background:var(--warn-bg); color:var(--warn); }
+
   /* ── forms ─────────────────────────────────────────────── */
   label { display:block; font-size:.68rem; letter-spacing:.1em; text-transform:uppercase;
           color:var(--ink-3); font-family:var(--mono); margin-bottom:6px; }
@@ -358,6 +368,15 @@
           <div><h2>Spend by key</h2><div class="sub">Who is actually costing you money</div></div>
         </div>
         <div class="body" id="spend-by-key"><div class="empty">Nothing spent yet</div></div>
+      </div>
+
+      <div class="card">
+        <div class="head">
+          <div><h2>Provider health</h2>
+          <div class="sub" id="health-sub">Learned from real traffic, not a pinger</div></div>
+          <button id="reset-breakers">Reset circuits</button>
+        </div>
+        <div class="body" id="targets"><div class="empty">Nothing has been called yet</div></div>
       </div>
 
       <div class="card">
@@ -698,6 +717,44 @@ function renderSpark(rows) {
      magenta answered, amber cut short, red failed, grey turned away.</div>`;
 }
 
+// ── provider health ───────────────────────────────────────────────────────
+
+// A state name is jargon. What an operator wants to know is what is happening
+// to their traffic because of it.
+const STATE_WORDS = {
+  closed: "healthy",
+  open: "skipped, circuit open",
+  half_open: "probing",
+};
+
+function renderTargets(health, failedOver) {
+  const rows = health.targets || [];
+  el("health-sub").textContent = failedOver
+    ? `${fmtInt(failedOver)} request(s) were saved by falling back`
+    : "Learned from real traffic, not a pinger";
+
+  if (!rows.length) {
+    el("targets").innerHTML = `<div class="empty">Nothing has been called yet</div>`;
+    return;
+  }
+  el("targets").innerHTML =
+    `<div class="targets">` +
+    rows.map((t) => {
+      const bits = [`${fmtInt(t.successes)} ok`, `${fmtInt(t.failures)} failed`];
+      // Surfaced separately so "why has this not opened" has an answer on the
+      // page rather than in the source.
+      if (t.ignored_failures) bits.push(`${fmtInt(t.ignored_failures)} not the provider's fault`);
+      if (t.times_opened) bits.push(`opened ${fmtInt(t.times_opened)}x`);
+      if (t.last_error) bits.push(`last: ${esc(t.last_error)}`);
+      return `<div class="target">
+        <div class="who">${esc(t.target)}</div>
+        <div><span class="tag ${esc(t.state)}">${esc(STATE_WORDS[t.state] || t.state)}</span></div>
+        <div class="meta">${bits.join(" &middot; ")}</div>
+      </div>`;
+    }).join("") +
+    `</div>`;
+}
+
 // ── drill ─────────────────────────────────────────────────────────────────
 
 function chaosSpec() {
@@ -758,11 +815,12 @@ async function runDrill() {
 
 async function refresh() {
   const dayParam = selectedDay ? `&day=${encodeURIComponent(selectedDay)}` : "";
-  const [stats, keys, ledger, spend] = await Promise.all([
+  const [stats, keys, ledger, spend, health] = await Promise.all([
     api("/admin/stats"),
     api("/admin/keys"),
     api(`/admin/ledger?limit=50${dayParam}`),
     api(`/admin/spend?days=${spendDays}${dayParam}`),
+    api("/admin/health"),
   ]);
   const arrived = seenRequests === null ? 0 : stats.totals.requests - seenRequests;
   seenRequests = stats.totals.requests;
@@ -771,6 +829,7 @@ async function refresh() {
   renderKeys(keys.data);
   renderLedger(ledger.data);
   renderSpendDays(spend);
+  renderTargets(health, stats.totals.failed_over);
   // Only flash when the ledger is showing live traffic. While a past day is
   // filtered, new rows are not what is on screen.
   if (arrived > 0 && !selectedDay) flashNewRows(arrived);
@@ -912,6 +971,11 @@ document.querySelectorAll("[data-days]").forEach((btn) => {
       b.setAttribute("aria-pressed", String(b === btn)));
     refresh();
   });
+});
+
+el("reset-breakers").addEventListener("click", async () => {
+  await api("/admin/breaker/reset", { method: "POST" });
+  await refresh();
 });
 
 el("d-fault").addEventListener("change", syncDrillFields);
