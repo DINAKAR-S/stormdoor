@@ -351,6 +351,20 @@ Two honest limits, both worth stating because a guarantee with unstated conditio
 
 ---
 
+## Self-hosting
+
+One provider key on your server, one virtual key per project, one ledger that
+tells you what each project spent. [docs/deploy.md](docs/deploy.md) is the full
+recipe: Docker Compose, minting a key per project, wiring n8n in through a
+Header Auth credential, and a Caddy config that exposes `/v1` to the world while
+keeping `/admin` and the dashboard off it.
+
+```bash
+docker compose up -d --build
+```
+
+---
+
 ## Roadmap
 
 stormdoor is repo one of four that together cover the fifteen backend systems

@@ -68,3 +68,41 @@ jobs:
 
       - name: Run the proof harness
         run: uv run python -m bench.harness
+
+  # docs/deploy.md tells people to run this image on a VPS holding their real
+  # provider key, so the image has to be known to build and boot, not assumed to.
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the image
+        run: docker build -t stormdoor:ci .
+
+      - name: Boot it and check it answers
+        run: |
+          docker run -d --name stormdoor-ci -p 8080:8080 \
+            -e STORMDOOR_ADMIN_TOKEN=ci-token stormdoor:ci
+          for i in $(seq 1 30); do
+            if curl -fsS localhost:8080/healthz > /dev/null; then
+              echo "healthy after ${i}s"; break
+            fi
+            if [ "$i" = "30" ]; then
+              echo "never became healthy"; docker logs stormdoor-ci; exit 1
+            fi
+            sleep 1
+          done
+          curl -fsS localhost:8080/healthz
+
+      - name: Check it is not running as root
+        run: |
+          user=$(docker exec stormdoor-ci whoami)
+          echo "container user: $user"
+          [ "$user" = "stormdoor" ] || { echo "expected to run as stormdoor"; exit 1; }
+
+      - name: Check the CLI works inside the image
+        run: docker exec stormdoor-ci stormdoor keys create ci-demo --budget 1
+
+      - name: Stop
+        if: always()
+        run: docker rm -f stormdoor-ci || true

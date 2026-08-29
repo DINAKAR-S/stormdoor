@@ -1,0 +1,27 @@
+# Minimal single-host deployment.
+#
+# Note the port binding: 127.0.0.1:8080. The gateway is NOT published to the
+# internet by this file. Put a reverse proxy in front of it that exposes only
+# /v1 and /healthz, and keep /admin and /dashboard on your own network or
+# behind an SSH tunnel. See docs/deploy.md for why, and for a Caddyfile.
+
+services:
+  stormdoor:
+    build: .
+    image: stormdoor:local
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - stormdoor-data:/data
+    environment:
+      # Generate once with `openssl rand -hex 16` and keep it out of git.
+      STORMDOOR_ADMIN_TOKEN: ${STORMDOOR_ADMIN_TOKEN:?set STORMDOOR_ADMIN_TOKEN in .env}
+      STORMDOOR_ANTHROPIC_API_KEY: ${STORMDOOR_ANTHROPIC_API_KEY:-}
+      STORMDOOR_OPENAI_API_KEY: ${STORMDOOR_OPENAI_API_KEY:-}
+      # Leave chaos off in production unless you are running a drill.
+      STORMDOOR_CHAOS_ENABLED: ${STORMDOOR_CHAOS_ENABLED:-false}
+      STORMDOOR_PRICING_FILE: ${STORMDOOR_PRICING_FILE:-}
+
+volumes:
+  stormdoor-data:
