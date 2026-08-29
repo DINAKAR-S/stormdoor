@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import secrets
 from pathlib import Path
 
@@ -39,6 +40,10 @@ log = logging.getLogger("stormdoor")
 
 # One file, no build step, no CDN. It ships inside the wheel.
 DASHBOARD_HTML = Path(__file__).parent / "static" / "dashboard.html"
+
+# A day filter reaches a SQL comparison, so it is validated in shape before it
+# gets there rather than trusted because the dashboard happened to send it.
+_DAY = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
 # ── admin request bodies ─────────────────────────────────────────────────────
@@ -118,14 +123,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         docs_url="/docs",
     )
 
-    if not settings.admin_token:
-        settings.admin_token = secrets.token_hex(16)
-        log.warning(
-            "no STORMDOOR_ADMIN_TOKEN set, generated one for this process: %s",
-            settings.admin_token,
-        )
-
     store = Store(settings.db_path)
+
+    if not settings.admin_token:
+        # Kept in the database rather than regenerated per process, so the token
+        # you write down still works tomorrow, and so `stormdoor admin-token`
+        # can tell you what it is when you forget.
+        settings.admin_token, created = store.ensure_admin_token()
+        log.warning(
+            "\n%s\n  No STORMDOOR_ADMIN_TOKEN was set, so the gateway %s one:\n\n"
+            "      %s\n\n"
+            "  Use it to sign in to the dashboard. It is stored in %s and stays\n"
+            "  the same across restarts. Look it up any time with:\n\n"
+            "      stormdoor admin-token\n%s",
+            "=" * 72,
+            "generated" if created else "is using the stored",
+            settings.admin_token,
+            settings.db_path,
+            "=" * 72,
+        )
     limiter = build_limiter(settings.limiter_backend, settings.redis_url)
     registry = build_registry(settings)
     prices = PriceBook.load(settings.pricing_file)
@@ -271,8 +287,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"key": key.public(), **summary}
 
     @app.get("/admin/ledger", dependencies=[Depends(_require_admin)])
-    async def ledger(limit: int = 50) -> dict:
-        return {"data": await store.recent_ledger(min(max(limit, 1), 500))}
+    async def ledger(limit: int = 50, day: str | None = None) -> dict:
+        if day is not None and not _DAY.fullmatch(day):
+            raise BadRequest(f"day must look like YYYY-MM-DD, got {day!r}", param="day")
+        return {"data": await store.recent_ledger(min(max(limit, 1), 500), day=day)}
+
+    @app.get("/admin/spend", dependencies=[Depends(_require_admin)])
+    async def spend(days: int = 14, day: str | None = None) -> dict:
+        """Daily spend, and optionally the per-key split for one day.
+
+        This is the view that answers "which day cost the most, and who spent it",
+        which the running totals cannot.
+        """
+        if day is not None and not _DAY.fullmatch(day):
+            raise BadRequest(f"day must look like YYYY-MM-DD, got {day!r}", param="day")
+        series = await store.spend_by_day(min(max(days, 1), 365))
+        payload: dict = {"days": series}
+        if series:
+            peak = max(series, key=lambda d: d["cost_usd"])
+            payload["peak"] = peak if peak["cost_usd"] > 0 else None
+        if day is not None:
+            payload["by_key"] = await store.spend_for_day(day)
+        return payload
 
     @app.get("/admin/stats", dependencies=[Depends(_require_admin)])
     async def stats() -> dict:

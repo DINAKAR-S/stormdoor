@@ -8,6 +8,7 @@ exactly $0.001 and the arithmetic in the assertions is readable.
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -44,6 +45,9 @@ def priced_app(tmp_path):
             admin_token="admin",
             pricing_file=pricing,
             default_max_tokens=4096,
+            # Needed by the reservation tests, which use injected failures to
+            # prove a failed request gives its claim back.
+            chaos_enabled=True,
             _env_file=None,
         )
     )
@@ -159,3 +163,95 @@ def test_cached_input_is_not_billed_twice():
                             cached_input_tokens=1000)
     plain, _ = book.cost_usd("claude-opus-5", input_tokens=1000, output_tokens=0)
     assert cost == pytest.approx(plain)
+
+
+# ── reservations: the concurrency fix ────────────────────────────────────────
+
+
+async def test_a_budget_holds_when_the_whole_burst_arrives_at_once(priced_app, priced_client):
+    """The bug this exists to prevent.
+
+    Admission used to read the spend, then decide. Sixty requests arriving
+    together each read the same spend, each concluded there was room, and a
+    $0.20 key spent $1.50. The stress harness measured a 650% overshoot.
+    Reserving atomically before the call is what closes it.
+    """
+    ceiling = 0.20
+    key, secret = await priced_app.state.store.create_key(name="racer", budget_usd=ceiling)
+    headers = {"Authorization": f"Bearer {secret}"}
+
+    results = await asyncio.gather(*(
+        priced_client.post("/v1/chat/completions", json=chat_body(max_tokens=16), headers=headers)
+        for _ in range(40)
+    ))
+    codes = [r.status_code for r in results]
+
+    refreshed = await priced_app.state.store.key_by_id(key.id)
+    assert refreshed.spent_usd <= ceiling, (
+        f"spent ${refreshed.spent_usd:.4f} against a ${ceiling:.2f} ceiling"
+    )
+    assert 200 in codes and 402 in codes, "some should be admitted and some refused"
+
+
+async def test_a_reservation_is_released_however_the_request_ends(priced_app, priced_client):
+    key, secret = await priced_app.state.store.create_key(name="settler", budget_usd=5.0)
+    headers = {"Authorization": f"Bearer {secret}"}
+
+    # answered, failed at the provider, and cut off mid-stream
+    await priced_client.post("/v1/chat/completions", json=chat_body(max_tokens=8), headers=headers)
+    await priced_client.post(
+        "/v1/chat/completions", json=chat_body(max_tokens=8),
+        headers={**headers, "X-Stormdoor-Chaos": "fault=error;status=503"},
+    )
+    async with priced_client.stream(
+        "POST", "/v1/chat/completions", json=chat_body(stream=True, max_tokens=32),
+        headers={**headers, "X-Stormdoor-Chaos": "fault=mid_stream_abort;after_chunks=3"},
+    ) as r:
+        async for _line in r.aiter_lines():
+            pass
+
+    refreshed = await priced_app.state.store.key_by_id(key.id)
+    assert abs(refreshed.reserved_usd) < 1e-9, (
+        f"${refreshed.reserved_usd} left reserved after three requests finished"
+    )
+
+
+async def test_a_failed_request_gives_its_reservation_back(priced_app, priced_client):
+    """A provider outage must not eat the budget it briefly claimed."""
+    key, secret = await priced_app.state.store.create_key(name="unlucky", budget_usd=0.10)
+    headers = {"Authorization": f"Bearer {secret}",
+               "X-Stormdoor-Chaos": "fault=error;status=503"}
+
+    for _ in range(20):
+        r = await priced_client.post(
+            "/v1/chat/completions", json=chat_body(max_tokens=16), headers=headers
+        )
+        assert r.status_code == 503
+
+    refreshed = await priced_app.state.store.key_by_id(key.id)
+    assert refreshed.spent_usd == 0.0
+    assert abs(refreshed.reserved_usd) < 1e-9
+
+    # And the key is still usable afterwards, not silently exhausted.
+    ok = await priced_client.post(
+        "/v1/chat/completions", json=chat_body(max_tokens=8),
+        headers={"Authorization": f"Bearer {secret}"},
+    )
+    assert ok.status_code == 200
+
+
+async def test_reservations_are_cleared_when_the_gateway_restarts(tmp_path):
+    """A process that dies mid-request must not shrink the budget forever."""
+    from stormdoor.store import Store
+
+    store = Store(tmp_path / "restart.db")
+    key, _secret = await store.create_key(name="crashed", budget_usd=1.0)
+    granted, _spent, _committed = await store.reserve(key.id, 0.40)
+    assert granted
+    assert (await store.key_by_id(key.id)).reserved_usd == 0.40
+    store.close()
+
+    # A fresh process against the same file: nothing can be in flight.
+    reopened = Store(tmp_path / "restart.db")
+    assert (await reopened.key_by_id(key.id)).reserved_usd == 0.0
+    reopened.close()

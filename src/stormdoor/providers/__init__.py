@@ -26,13 +26,49 @@ class ProviderRegistry:
     def __init__(self, providers: list[Provider]):
         self._providers = providers
 
-    def resolve(self, model: str) -> Provider:
+    def resolve(self, model: str) -> tuple[Provider, str]:
+        """Turn a model id into ``(provider, the id to send upstream)``.
+
+        Two spellings are accepted, because people arrive expecting one or the
+        other and guessing wrong should not be a 404:
+
+        ``gpt-4o-mini``           routed by prefix, and sent on as-is
+        ``openai/gpt-4o-mini``    routed to the named provider explicitly
+
+        The prefixed form is worth having beyond taste. It disambiguates when a
+        model name exists on more than one provider, and it is the only way to
+        reach an OpenAI-compatible server whose model is called something the
+        prefix rules would never guess, like ``openai/llama-3.1-70b`` pointed at
+        a local vLLM. The provider name is stripped before the call, so upstream
+        sees the id it knows.
+        """
+        if "/" in model:
+            name, _, upstream = model.partition("/")
+            for provider in self._providers:
+                if provider.name == name.lower():
+                    if not upstream:
+                        raise UnknownModel(
+                            f"{model!r} names a provider but no model. "
+                            f"Write it as {name}/<model>.",
+                            param="model",
+                        )
+                    return provider, upstream
+            raise UnknownModel(
+                f"no provider called {name!r} is registered. "
+                f"Available: {[p.name for p in self._providers]}. "
+                f"You can also drop the prefix and send {upstream!r} on its own.",
+                param="model",
+            )
+
         for provider in self._providers:
             if provider.handles(model):
-                return provider
+                return provider, model
+
         raise UnknownModel(
             f"no provider is registered for model {model!r}. "
-            f"Registered providers: {[p.name for p in self._providers]}",
+            f"Registered providers: {[p.name for p in self._providers]}. "
+            f"Model ids route by prefix (claude-... to anthropic, gpt-... to openai), "
+            f"or name the provider explicitly as <provider>/<model>.",
             param="model",
         )
 

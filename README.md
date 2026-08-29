@@ -21,6 +21,11 @@ this README is produced by a harness in `bench/` that you can rerun.
 > streaming, virtual keys, budgets, rate limits, fault injection, the ledger.
 > Routing, failover and the semantic cache are next. See [Roadmap](#roadmap).
 
+![The stormdoor dashboard: gateway counters and spend by day, with the most expensive day called out](docs/screenshots/dashboard.png)
+
+Every request that goes through the gateway, what it cost, and which day cost
+the most. Click a day and everything below filters to it.
+
 ---
 
 ## The problem, in one story
@@ -87,10 +92,21 @@ uv run stormdoor keys create demo --budget 5 --rpm 60 --tpm 20000
 uv run stormdoor serve --chaos
 ```
 
-Open [localhost:8080](http://localhost:8080) and the dashboard asks for the
-admin token the gateway printed to its log. From there you can see every key
-and what it has spent, watch the ledger fill up live, and break the gateway on
-purpose from a dropdown.
+Open [localhost:8080](http://localhost:8080). The dashboard asks for an admin
+token. To find it:
+
+```bash
+uv run stormdoor admin-token
+```
+
+That prints it and stays the same across restarts. The gateway also prints it in
+a banner the first time it starts. If you would rather choose it yourself, set
+`STORMDOOR_ADMIN_TOKEN` and that wins; `stormdoor admin-token --reset` replaces
+a stored one.
+
+Signed in, you get every key and what it has spent, spend by day with the
+expensive day called out, a live ledger, and a dropdown that breaks the gateway
+on purpose.
 
 Or talk to it like any OpenAI endpoint. `echo-small` is a local, deterministic
 model that never leaves the process, so everything below is free:
@@ -223,13 +239,37 @@ it yet. It is the anchor `Last-Event-ID` resume needs in week 4, and adding it
 now costs one line where retrofitting it later would change the wire format
 under existing clients.
 
-**A dashboard, in one file.** Served at `/`, no build step, no framework, and
-no external request of any kind, which a test enforces. It shows the keys and
-their budget bars, gateway-wide counters, a live ledger with the outcome of
-every request, a latency strip coloured by what happened, and a panel that
-fires one real request through the real path with a fault of your choosing. It
-talks to the same admin API the CLI does, so there is nothing in it you could
-not do with curl.
+**A dashboard, in one file.** Served at `/`, no build step, no framework, no web
+font, and no external request of any kind, which a test enforces. Gateway-wide
+counters, keys with their budget bars, spend by key, **spend by day with the
+most expensive day called out**, a live ledger of every request including the
+refused ones, a latency strip coloured by outcome, and a panel that fires one
+real request through the real path with a fault of your choosing. Click any day
+in the chart and the ledger filters to it, so "what did we actually run on the
+day that cost the most" is one click rather than a query. It talks to the same
+admin API the CLI does, so there is nothing in it you could not do with curl.
+
+**You do not have to cap a key to watch it.** A budget is optional and always
+was, but the dashboard makes it a choice you make on purpose: *track spend only*,
+or *cap it with a budget*. Track-only keys run without a ceiling and every cent
+they spend is still recorded, which is the right setting when what you want is to
+find out what something costs before you decide what it is allowed to cost.
+
+![Creating a key, with track-only and capped modes as an explicit choice](docs/screenshots/new-key.png)
+
+Keys and the live ledger side by side. The `tracking only` pill is a key with no
+ceiling, deliberately, rather than a budget somebody forgot to fill in:
+
+![The keys table and the live ledger](docs/screenshots/keys-and-ledger.png)
+
+Which key is actually costing you money, and the panel that breaks the gateway
+on purpose:
+
+![Spend ranked by key, and the fault injection panel](docs/screenshots/spend-and-drill.png)
+
+Latency of recent requests, coloured by what happened to each one:
+
+![A latency strip coloured by request outcome](docs/screenshots/latency.png)
 
 ---
 
@@ -249,6 +289,64 @@ provider returns.
 
 ---
 
+## Naming a model
+
+You put the model in the `model` field of the request, exactly where an OpenAI
+client already puts it. Two spellings work, so you do not have to guess:
+
+```json
+{ "model": "gpt-4o-mini" }
+{ "model": "openai/gpt-4o-mini" }
+```
+
+**Bare id.** Routed by prefix. This is the one to use most of the time, because
+it means an existing OpenAI client works with no change but the base URL.
+
+| You want | You write |
+|---|---|
+| An OpenAI model | `gpt-4o-mini`, `gpt-4o`, `o3-mini` |
+| A Claude model | `claude-opus-5`, `claude-sonnet-5`, `claude-haiku-4-5` |
+| The built-in local model | `echo-small`, `echo-large` |
+
+Prefixes route as: `claude-` to Anthropic; `gpt-`, `o1`, `o3`, `o4` and
+`chatgpt-` to OpenAI; `echo-` to the local provider. A model released after this
+code was written still routes correctly, because the rule is the prefix and not
+a hardcoded list.
+
+**Provider-prefixed id.** `<provider>/<model>`, where provider is one of the
+names in `GET /healthz`. Currently `anthropic`, `openai`, `echo`.
+
+```json
+{ "model": "anthropic/claude-opus-5" }
+```
+
+The prefix is stripped before the call, so upstream only ever sees the id it
+knows, and the ledger records that id too. Reach for this form when:
+
+- The bare name would not route. A local vLLM or Ollama server behind
+  `STORMDOOR_OPENAI_BASE_URL` might serve `llama-3.1-70b`, which no prefix rule
+  would ever guess. `openai/llama-3.1-70b` sends it there anyway.
+- You want the routing to be obvious in the calling code rather than implied.
+
+A key's model allow-list accepts either spelling, so allowing `gpt-4o-mini` does
+not lock out someone who writes `openai/gpt-4o-mini`.
+
+**Not sure what this gateway can route?** Ask it:
+
+```bash
+curl localhost:8080/v1/models -H "Authorization: Bearer sd-..."
+```
+
+That lists what each provider advertises. OpenAI models are not enumerated
+locally, because the set depends on your account and, behind a custom base URL,
+on somebody else's server. Send the id and it routes.
+
+**Getting it wrong tells you how to get it right.** An unroutable model returns a
+404 that names the registered providers and both spellings, rather than a bare
+"model not found".
+
+---
+
 ## Configuration
 
 Everything takes a `STORMDOOR_` prefix, and `.env` is read if present.
@@ -257,7 +355,7 @@ Everything takes a `STORMDOOR_` prefix, and `.env` is read if present.
 |---|---|---|
 | `STORMDOOR_HOST` / `STORMDOOR_PORT` | `127.0.0.1` / `8080` | Bind address |
 | `STORMDOOR_DB_PATH` | `./stormdoor.db` | Keys and ledger |
-| `STORMDOOR_ADMIN_TOKEN` | generated, logged once | Guards `/admin/*` |
+| `STORMDOOR_ADMIN_TOKEN` | generated and stored in the db | Guards `/admin/*`. Read it with `stormdoor admin-token` |
 | `STORMDOOR_LIMITER_BACKEND` | `memory` | `memory` or `redis` |
 | `STORMDOOR_REDIS_URL` | unset | Required for the redis limiter |
 | `STORMDOOR_CHAOS_ENABLED` | `false` | Arms fault injection |
@@ -289,8 +387,9 @@ more room say so in the request.
 | `GET /admin/keys` | admin | List keys with spend |
 | `GET /admin/keys/{id}/usage` | admin | Totals and recent requests |
 | `POST /admin/keys/{id}/disable` | admin | Kill a key immediately |
-| `GET /admin/ledger` | admin | Recent requests across every key |
+| `GET /admin/ledger` | admin | Recent requests, optionally `?day=YYYY-MM-DD` |
 | `GET /admin/stats` | admin | Gateway-wide counters |
+| `GET /admin/spend` | admin | Daily spend and the peak day, `?days=` and `?day=` |
 | `POST /admin/drill` | admin | Fire one request, optionally with a fault |
 
 Errors keep the OpenAI envelope (`{"error": {"message", "type", "code"}}`) so
@@ -315,6 +414,18 @@ behind them is. No overspend, every injected failure classified honestly, every
 killed stream accounted for. If one of those stops holding, the harness exits
 non-zero and CI goes red.
 
+There is a second harness that runs before anything is published:
+
+```bash
+uv run python -m bench.stress
+```
+
+That one is adversarial rather than descriptive. It pushes concurrency, hostile
+input, an empty database, a restart, a dead provider and a ledger with history
+in it, and it has already earned its place: it caught a budget that overshot its
+ceiling by **650%** when sixty requests arrived at once, which every unit test in
+the suite was passing straight over.
+
 <!-- BENCH:START -->
 Generated by `uv run python -m bench.harness` on CPython 3.11.0, Windows AMD64. Local `echo` provider, so no network and no API key are involved.
 
@@ -325,10 +436,10 @@ Generated by `uv run python -m bench.harness` on CPython 3.11.0, Windows AMD64. 
 | Requests | 600 |
 | Concurrency | 32 |
 | Successful | 600 / 600 |
-| Throughput | 253 req/s |
-| Latency p50 | 73.8 ms |
-| Latency p95 | 241.4 ms |
-| Latency p99 | 696.8 ms |
+| Throughput | 432 req/s |
+| Latency p50 | 34.1 ms |
+| Latency p95 | 116.4 ms |
+| Latency p99 | 576.6 ms |
 | Transport | in-process ASGI |
 
 Full gateway path per request: auth, model check, both rate-limit buckets, budget admission, provider call, ledger write. The provider is local and the transport is in-process, so this isolates the gateway's own overhead from both the model's speed and the socket. Add your network and your model on top.
@@ -342,10 +453,10 @@ Full gateway path per request: auth, model check, both rate-limit buckets, budge
 | Streams | 120 |
 | Transport | real uvicorn server over TCP |
 | Simulated per-chunk delay | 4 ms |
-| TTFT p50 | 10.7 ms |
-| TTFT p95 | 22.8 ms |
-| Full response p50 | 28.8 ms |
-| First word arrives after | 37.3% of the total wait |
+| TTFT p50 | 5.2 ms |
+| TTFT p95 | 10.3 ms |
+| Full response p50 | 13.3 ms |
+| First word arrives after | 38.9% of the total wait |
 
 Measured from request start to the first frame carrying content, which is the number a user perceives as the model's speed. The gateway pays its overhead once, at the front, and then gets out of the way of the stream.
 
@@ -357,10 +468,10 @@ Measured from request start to the first frame carrying content, which is the nu
 |---|---|
 | Requests | 400 |
 | Fault rate requested | 25% |
-| Observed 503s | 93 (23.2%) |
-| Succeeded anyway | 307 |
-| Marked retryable | 93 / 93 |
-| Ledger rows tagged as a drill | 93 |
+| Observed 503s | 92 (23.0%) |
+| Succeeded anyway | 308 |
+| Marked retryable | 92 / 92 |
+| Ledger rows tagged as a drill | 92 |
 
 Every failure is tagged in the ledger with the fault that caused it, so a rehearsal is never mistaken for a real outage when the history is read back. The retryable flag is what week 2's fallback engine will act on.
 
@@ -399,7 +510,7 @@ The hardest partial failure to handle honestly. The status line has already said
 | Cost of a refused request | $0.0000, no upstream call is made |
 | Refusals recorded | 22 |
 
-Refusal happens before the provider is called, so a request that would break the budget costs nothing but a SQLite write. Sequentially, against a provider whose token count the local estimate matches exactly, the ceiling holds. See the overshoot note below for where it does not.
+Refusal happens before the provider is called, so a request that would break the budget costs nothing but a SQLite write. The ceiling holds under concurrency too, because admission claims the worst case atomically rather than reading a spend figure other in-flight requests are about to change. See the note below for the one case where it can still be beaten.
 
 - PASS: the budget admitted work before it closed
 - PASS: the budget eventually closed the door
@@ -425,7 +536,9 @@ A bucket holds a full minute's allowance, so the first 30 arrive together and ar
 
 ### Where the budget ceiling does not hold
 
-Two honest limits, both worth stating because a guarantee with unstated conditions is a lie with good manners. First, admission prices the prompt with a local heuristic of about four characters per token, and that heuristic undershoots on code, CJK text and base64, so a real provider can bill more input than was estimated. Second, admission reads the spend recorded so far, so N requests in flight at once can each be admitted against the same remaining budget. The overshoot is bounded by the estimation error plus the worst-case cost of the in-flight requests. Reserving budget at admission and settling it afterwards closes the second gap, and is week 4's work.
+One honest limit, worth stating because a guarantee with unstated conditions is a lie with good manners. Admission prices the prompt with a local heuristic of about four characters per token, and that heuristic undershoots on code, CJK text and base64, so a real provider can bill more input than was estimated. The overshoot is bounded by that estimation error on a single request.
+
+The larger gap is closed. Admission used to read the spend and then decide, which is a check-then-act race: `bench/stress.py` fired sixty requests at a $0.20 key at once and watched it spend $1.50, a 650% overshoot. Admission now claims the worst case atomically before the call and settles it against the real cost afterwards, in the same transaction as the ledger row. The same drill now overshoots by $0.00. A crash mid-request would strand a claim, so every reservation on disk is cleared at startup, when by definition nothing is in flight.
 <!-- BENCH:END -->
 
 ---
@@ -446,8 +559,8 @@ docker compose up -d --build
 
 ## Roadmap
 
-stormdoor is repo one of four that together cover the fifteen backend systems
-an AI product needs. This one is the inference plane.
+Built in the open, a week at a time. Week 1 is done and is what this repo does
+today; the rest is what it is heading towards.
 
 | Week | Ships |
 |---|---|
@@ -455,6 +568,19 @@ an AI product needs. This one is the inference plane.
 | 2 | Health checks, circuit breaker, complexity-based routing, failover with retries |
 | 3 | Semantic cache on pgvector, PII redaction and injection heuristics as hooks |
 | 4 | OpenTelemetry tracing, Stripe metering, SSE resume across a mid-stream failover |
+
+---
+
+## What this got wrong first
+
+[docs/lessons.md](docs/lessons.md) is an honest log of the defects found while
+building week 1: a budget that overshot its ceiling by 650% under concurrency
+while every test passed, a dashboard that showed stale numbers as if they were
+live once the gateway died, a benchmark that measured its own instrument, a CI
+matrix that would have tested one Python version four times.
+
+None of them were found by the suite going red. All of them were found by
+looking on purpose.
 
 ---
 

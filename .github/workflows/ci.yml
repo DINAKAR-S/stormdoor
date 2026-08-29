@@ -69,6 +69,12 @@ jobs:
       - name: Run the proof harness
         run: uv run python -m bench.harness
 
+      # Adversarial rather than descriptive: concurrency, hostile input, an
+      # empty database, a restart, a dead provider, a ledger with history in it.
+      # This is the harness that caught a 650% budget overshoot under load.
+      - name: Run the stress passes
+        run: uv run python -m bench.stress
+
   # docs/deploy.md tells people to run this image on a VPS holding their real
   # provider key, so the image has to be known to build and boot, not assumed to.
   docker:

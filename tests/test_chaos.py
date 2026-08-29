@@ -146,12 +146,20 @@ async def test_an_aborted_stream_is_recorded_as_aborted_not_as_success(client, a
 
 
 async def test_a_slow_fault_delays_without_failing(client, auth):
-    r = await client.post(
+    fast = await client.post("/v1/chat/completions", json=chat_body(), headers=auth)
+    slow = await client.post(
         "/v1/chat/completions", json=chat_body(),
-        headers={**auth, **chaos("fault=slow;delay_ms=50")},
+        headers={**auth, **chaos("fault=slow;delay_ms=120")},
     )
-    assert r.status_code == 200
-    assert r.json()["stormdoor"]["latency_ms"] >= 50
+    assert slow.status_code == 200
+
+    # Compared against an unfaulted request rather than against the wall clock.
+    # Windows timer granularity is about 15ms and asyncio.sleep can return a few
+    # milliseconds early, so asserting "at least the requested delay" made this
+    # test fail intermittently at 46ms for a 50ms sleep. The claim that actually
+    # matters is that the fault made the request meaningfully slower.
+    delta = slow.json()["stormdoor"]["latency_ms"] - fast.json()["stormdoor"]["latency_ms"]
+    assert delta >= 80, f"slow fault only added {delta}ms"
 
 
 # ── the safety catch ─────────────────────────────────────────────────────────

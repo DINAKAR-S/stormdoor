@@ -63,6 +63,17 @@ class Admission:
     prompt_tokens_estimate: int
     max_output_tokens: int
     estimated_cost_usd: float | None  # None when the model has no verified rate
+    # What was actually claimed against the budget and must be given back when
+    # the request ends, whichever way it ends.
+    reserved_usd: float = 0.0
+    # The id to send upstream, with any "provider/" prefix stripped off.
+    upstream_model: str = ""
+
+    def outbound(self, req: ChatCompletionRequest) -> ChatCompletionRequest:
+        """The request as the provider should see it."""
+        if not self.upstream_model or self.upstream_model == req.model:
+            return req
+        return req.model_copy(update={"model": self.upstream_model})
 
 
 class Gateway:
@@ -98,12 +109,15 @@ class Gateway:
     # ── 2 to 5. admission ────────────────────────────────────────────────
 
     async def admit(self, key: VirtualKey, req: ChatCompletionRequest) -> Admission:
-        if not key.allows_model(req.model):
+        provider, upstream_model = self.registry.resolve(req.model)
+
+        # An allow-list entry matches either spelling. Listing "gpt-4o-mini"
+        # and then being refused for sending "openai/gpt-4o-mini" would be a
+        # trap, since both name the same model.
+        if not (key.allows_model(req.model) or key.allows_model(upstream_model)):
             raise ForbiddenError(
                 f"key {key.name!r} is not allowed to use model {req.model!r}", param="model"
             )
-
-        provider = self.registry.resolve(req.model)
 
         prompt_tokens = estimate_prompt_tokens([m.text() for m in req.messages])
         max_output = req.max_tokens or self.settings.default_max_tokens
@@ -128,27 +142,34 @@ class Gateway:
                     limit="tpm",
                 )
 
-        estimate = self.prices.max_cost_usd(req.model, prompt_tokens, max_output)
+        estimate = self.prices.max_cost_usd(upstream_model, prompt_tokens, max_output)
 
-        if (
-            key.budget_usd is not None
-            and estimate is not None
-            and key.spent_usd + estimate > key.budget_usd
-        ):
-            raise BudgetExceeded(
-                f"this request could cost up to ${estimate:.4f}, which would take "
-                f"key {key.name!r} past its ${key.budget_usd:.2f} budget "
-                f"(${key.spent_usd:.4f} already spent)",
-                spent_usd=key.spent_usd,
-                budget_usd=key.budget_usd,
-                estimate_usd=estimate,
-            )
+        # Claim the worst case against the budget before the call, rather than
+        # comparing against a spend figure that other in-flight requests are
+        # about to change. The claim is atomic; see Store.reserve for why a
+        # read-then-decide let a $0.20 key spend $1.50 under load.
+        reserved = 0.0
+        if key.budget_usd is not None and estimate is not None:
+            granted, spent, committed = await self.store.reserve(key.id, estimate)
+            if not granted:
+                raise BudgetExceeded(
+                    f"this request could cost up to ${estimate:.4f}, which would take "
+                    f"key {key.name!r} past its ${key.budget_usd:.2f} budget "
+                    f"(${spent:.4f} spent, ${committed - spent:.4f} reserved by requests "
+                    f"already in flight)",
+                    spent_usd=spent,
+                    budget_usd=key.budget_usd,
+                    estimate_usd=estimate,
+                )
+            reserved = estimate
 
         return Admission(
             provider=provider,
             prompt_tokens_estimate=prompt_tokens,
             max_output_tokens=max_output,
             estimated_cost_usd=estimate,
+            reserved_usd=reserved,
+            upstream_model=upstream_model,
         )
 
     # ── 8. ledger ────────────────────────────────────────────────────────
@@ -164,6 +185,7 @@ class Gateway:
         status: str,
         streamed: bool,
         error_code: str | None = None,
+        reservation: float = 0.0,
     ) -> float:
         cost, priced = self.prices.cost_usd(
             model, usage.input_tokens, usage.output_tokens, usage.cached_input_tokens
@@ -184,6 +206,7 @@ class Gateway:
             ttft_ms=ctx.ttft_ms,
             streamed=streamed,
             chaos_fault=ctx.chaos_fault,
+            reservation=reservation,
         )
         if not priced:
             log.warning(
@@ -230,12 +253,14 @@ class Gateway:
         try:
             await chaos.before_call()
             result: Completion = await provider.complete(
-                req, timeout_s=self.settings.request_timeout_s
+                admission.outbound(req), timeout_s=self.settings.request_timeout_s
             )
         except ProviderError as err:
             await self._record(
-                key=key, ctx=ctx, model=req.model, provider=provider.name,
+                key=key, ctx=ctx, model=admission.upstream_model or req.model,
+                provider=provider.name,
                 usage=TokenUsage(), status="error", streamed=False, error_code=err.code,
+                reservation=admission.reserved_usd,
             )
             raise
 
@@ -243,6 +268,7 @@ class Gateway:
         cost = await self._record(
             key=key, ctx=ctx, model=result.model, provider=provider.name,
             usage=result.usage, status="ok", streamed=False,
+            reservation=admission.reserved_usd,
         )
         return _completion_body(req, result, cost, ctx)
 
@@ -272,7 +298,7 @@ class Gateway:
         created = int(time.time())
         index = 0
         usage = TokenUsage()
-        model_used = req.model
+        model_used = admission.upstream_model or req.model
         finish_reason = "stop"
         status = "ok"
         error_code: str | None = None
@@ -291,7 +317,9 @@ class Gateway:
 
             yield frame(_chunk(cid, created, model_used, delta={"role": "assistant"}))
 
-            async for event in provider.stream(req, timeout_s=self.settings.request_timeout_s):
+            async for event in provider.stream(
+                admission.outbound(req), timeout_s=self.settings.request_timeout_s
+            ):
                 if isinstance(event, TextDelta):
                     ctx.mark_first_token()
                     text_seen += 1
@@ -326,6 +354,7 @@ class Gateway:
             await self._record(
                 key=key, ctx=ctx, model=model_used, provider=provider.name,
                 usage=usage, status=status, streamed=True, error_code=error_code,
+                reservation=admission.reserved_usd,
             )
 
 

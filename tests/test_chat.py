@@ -173,3 +173,74 @@ async def test_healthz_reports_what_is_armed(client):
     assert body["status"] == "ok"
     assert "echo" in body["providers"]
     assert body["chaos_enabled"] is True
+
+
+# ── how you spell a model id ─────────────────────────────────────────────────
+
+
+async def test_a_bare_model_id_routes_by_prefix(client, auth):
+    r = await client.post("/v1/chat/completions", json=chat_body(model="echo-small"), headers=auth)
+    assert r.status_code == 200
+    assert r.json()["model"] == "echo-small"
+
+
+async def test_a_provider_prefixed_id_routes_to_that_provider(client, auth):
+    """Both spellings work, because guessing wrong should not be a 404."""
+    r = await client.post("/v1/chat/completions", json=chat_body(model="echo/echo-small"),
+                          headers=auth)
+    assert r.status_code == 200
+    # The prefix is stripped before the call, so upstream sees the id it knows.
+    assert r.json()["model"] == "echo-small"
+
+
+async def test_both_spellings_produce_the_same_answer(client, auth):
+    bare = await client.post("/v1/chat/completions", json=chat_body(model="echo-small"),
+                             headers=auth)
+    prefixed = await client.post("/v1/chat/completions", json=chat_body(model="echo/echo-small"),
+                                 headers=auth)
+    assert (bare.json()["choices"][0]["message"]["content"]
+            == prefixed.json()["choices"][0]["message"]["content"])
+
+
+async def test_an_unknown_provider_prefix_says_which_ones_exist(client, auth):
+    r = await client.post("/v1/chat/completions", json=chat_body(model="mistral/large"),
+                          headers=auth)
+    assert r.status_code == 404
+    message = r.json()["error"]["message"]
+    assert "mistral" in message
+    assert "echo" in message, "the error should list what is actually registered"
+
+
+async def test_a_prefix_with_no_model_is_refused(client, auth):
+    r = await client.post("/v1/chat/completions", json=chat_body(model="echo/"), headers=auth)
+    assert r.status_code == 404
+    assert "no model" in r.json()["error"]["message"]
+
+
+async def test_an_unroutable_bare_id_explains_the_two_spellings(client, auth):
+    r = await client.post("/v1/chat/completions", json=chat_body(model="llama-3"), headers=auth)
+    assert r.status_code == 404
+    message = r.json()["error"]["message"]
+    assert "<provider>/<model>" in message, "the error should teach the prefixed form"
+
+
+async def test_an_allow_list_matches_either_spelling(client, store):
+    """Listing the bare id must not lock out the prefixed one, or the reverse."""
+    _key, secret = await store.create_key(name="either", allowed_models=["echo-small"])
+    headers = {"Authorization": f"Bearer {secret}"}
+
+    for model in ("echo-small", "echo/echo-small"):
+        r = await client.post("/v1/chat/completions", json=chat_body(model=model), headers=headers)
+        assert r.status_code == 200, f"{model} should be allowed"
+
+    denied = await client.post("/v1/chat/completions", json=chat_body(model="echo-large"),
+                               headers=headers)
+    assert denied.status_code == 403
+
+
+async def test_the_ledger_records_the_upstream_id_not_the_prefixed_one(client, auth, key, store):
+    virtual_key, _secret = key
+    await client.post("/v1/chat/completions", json=chat_body(model="echo/echo-large"),
+                      headers=auth)
+    row = (await store.usage_summary(virtual_key.id))["recent"][0]
+    assert row["model"] == "echo-large", "billing should key off the id the provider knows"

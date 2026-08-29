@@ -2,11 +2,38 @@
 
 from __future__ import annotations
 
+import json
 import re
 
+import pytest
+import pytest_asyncio
 from conftest import ADMIN_TOKEN, chat_body
+from httpx import ASGITransport, AsyncClient
+
+from stormdoor.app import create_app
+from stormdoor.config import Settings
 
 ADMIN = {"X-Stormdoor-Admin": ADMIN_TOKEN}
+
+
+@pytest.fixture
+def priced_dashboard_app(tmp_path):
+    """A gateway where the echo model actually costs money, so spend is visible."""
+    pricing = tmp_path / "pricing.json"
+    pricing.write_text(json.dumps({
+        "echo-small": {"input_per_mtok": 1000.0, "output_per_mtok": 1000.0,
+                       "source": "fictional, for tests", "checked_on": "2026-08-29"},
+    }), encoding="utf-8")
+    return create_app(Settings(db_path=tmp_path / "spend.db", admin_token=ADMIN_TOKEN,
+                               chaos_enabled=True, pricing_file=pricing, _env_file=None))
+
+
+@pytest_asyncio.fixture
+async def priced_dash_client(priced_dashboard_app):
+    async with AsyncClient(transport=ASGITransport(app=priced_dashboard_app),
+                           base_url="http://stormdoor.test") as c:
+        yield c
+
 
 
 async def test_dashboard_is_served_and_self_contained(client):
@@ -253,3 +280,132 @@ async def test_the_dashboard_can_say_the_gateway_is_unreachable(client):
     assert "no longer live" in html, "the banner must say the numbers are stale"
     # The poll loop has to distinguish "your token is wrong" from "it is down".
     assert "err.status === 401" in html
+
+
+# ── spend by day, and the day filter ─────────────────────────────────────────
+
+
+async def test_spend_by_day_reports_a_series_and_a_peak(client, auth):
+    for _ in range(3):
+        await client.post("/v1/chat/completions", json=chat_body(), headers=auth)
+
+    body = (await client.get("/admin/spend?days=14", headers=ADMIN)).json()
+    assert len(body["days"]) == 1, "everything happened today"
+    today = body["days"][0]
+    assert today["requests"] == 3
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", today["day"])
+    # The echo model is priced at zero, so there is no peak to point at.
+    assert body["peak"] is None
+
+
+async def test_spend_by_day_names_the_most_expensive_day(priced_dashboard_app, priced_dash_client):
+    _key, secret = await priced_dashboard_app.state.store.create_key(name="spender")
+    for _ in range(4):
+        await priced_dash_client.post(
+            "/v1/chat/completions", json=chat_body(max_tokens=16),
+            headers={"Authorization": f"Bearer {secret}"},
+        )
+
+    body = (await priced_dash_client.get("/admin/spend", headers=ADMIN)).json()
+    assert body["peak"] is not None
+    assert body["peak"]["cost_usd"] > 0
+    assert body["peak"]["day"] == body["days"][-1]["day"]
+
+
+async def test_asking_for_one_day_returns_who_spent_it(priced_dashboard_app, priced_dash_client):
+    _key, secret = await priced_dashboard_app.state.store.create_key(name="culprit")
+    await priced_dash_client.post(
+        "/v1/chat/completions", json=chat_body(max_tokens=16),
+        headers={"Authorization": f"Bearer {secret}"},
+    )
+    day = (await priced_dash_client.get("/admin/spend", headers=ADMIN)).json()["days"][-1]["day"]
+
+    body = (await priced_dash_client.get(f"/admin/spend?day={day}", headers=ADMIN)).json()
+    assert body["by_key"][0]["key_name"] == "culprit"
+    assert body["by_key"][0]["cost_usd"] > 0
+
+
+async def test_the_ledger_can_be_filtered_to_one_day(client, auth):
+    await client.post("/v1/chat/completions", json=chat_body(), headers=auth)
+    day = (await client.get("/admin/spend", headers=ADMIN)).json()["days"][-1]["day"]
+
+    today = (await client.get(f"/admin/ledger?day={day}", headers=ADMIN)).json()["data"]
+    assert len(today) == 1
+
+    other = (await client.get("/admin/ledger?day=2001-01-01", headers=ADMIN)).json()["data"]
+    assert other == [], "a day with nothing in it is empty, not everything"
+
+
+async def test_a_malformed_day_is_refused_before_it_reaches_sql(client):
+    """The filter reaches a query, so its shape is checked rather than trusted."""
+    for bad in ("not-a-day", "2026-13-99x", "'; DROP TABLE usage_records; --", "2026-8-1"):
+        r = await client.get("/admin/ledger", params={"day": bad}, headers=ADMIN)
+        assert r.status_code == 400, f"{bad!r} should be refused"
+        r2 = await client.get("/admin/spend", params={"day": bad}, headers=ADMIN)
+        assert r2.status_code == 400, f"{bad!r} should be refused"
+
+    # and the table is still there
+    assert (await client.get("/admin/ledger", headers=ADMIN)).status_code == 200
+
+
+async def test_the_days_range_is_clamped(client):
+    for days in (0, -3, 99999):
+        assert (await client.get(f"/admin/spend?days={days}", headers=ADMIN)).status_code == 200
+
+
+async def test_the_dashboard_ships_the_day_filter_ui(client):
+    html = (await client.get("/dashboard")).text
+    assert 'id="spend-days"' in html
+    assert "renderSpendDays" in html
+    assert 'id="clear-day"' in html
+
+
+# ── finding the admin token ──────────────────────────────────────────────────
+
+
+def test_a_generated_admin_token_survives_a_restart(tmp_path):
+    """Regenerating per process meant one missed log line locked you out."""
+    from stormdoor.store import Store
+
+    store = Store(tmp_path / "tok.db")
+    first, created = store.ensure_admin_token()
+    assert created is True
+    assert len(first) == 32
+    store.close()
+
+    reopened = Store(tmp_path / "tok.db")
+    second, created_again = reopened.ensure_admin_token()
+    reopened.close()
+
+    assert second == first, "the token must be the same after a restart"
+    assert created_again is False
+
+
+def test_an_app_with_no_configured_token_uses_the_stored_one(tmp_path):
+    from stormdoor.config import Settings as S
+
+    def make():
+        return create_app(S(db_path=tmp_path / "app.db", admin_token=None, _env_file=None))
+
+    first = make().state.settings.admin_token
+    second = make().state.settings.admin_token
+    assert first and first == second, "restarting must not invalidate the token"
+
+
+def test_an_explicit_token_wins_over_the_stored_one(tmp_path):
+    from stormdoor.config import Settings as S
+    from stormdoor.store import Store
+
+    store = Store(tmp_path / "wins.db")
+    stored, _ = store.ensure_admin_token()
+    store.close()
+
+    app = create_app(S(db_path=tmp_path / "wins.db", admin_token="chosen-by-me",
+                       _env_file=None))
+    assert app.state.settings.admin_token == "chosen-by-me"
+    assert app.state.settings.admin_token != stored
+
+
+async def test_the_sign_in_screen_says_where_to_find_the_token(client):
+    html = (await client.get("/dashboard")).text
+    assert "stormdoor admin-token" in html, "the gate must name the command that prints it"

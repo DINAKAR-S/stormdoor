@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS virtual_keys (
     key_prefix     TEXT NOT NULL,
     budget_usd     REAL,
     spent_usd      REAL NOT NULL DEFAULT 0.0,
+    reserved_usd   REAL NOT NULL DEFAULT 0.0,
     rpm            INTEGER,
     tpm            INTEGER,
     allowed_models TEXT NOT NULL DEFAULT '[]',
@@ -78,6 +79,14 @@ CREATE TABLE IF NOT EXISTS usage_records (
     FOREIGN KEY (key_id) REFERENCES virtual_keys(id)
 );
 
+-- Small key/value table for things the gateway needs to remember about itself.
+-- Currently just the generated admin token, which has to survive a restart or
+-- the dashboard locks you out every time the process comes back.
+CREATE TABLE IF NOT EXISTS gateway_settings (
+    name  TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_usage_key_ts   ON usage_records(key_id, ts);
 CREATE INDEX IF NOT EXISTS idx_usage_request  ON usage_records(request_id);
 CREATE INDEX IF NOT EXISTS idx_keys_hash      ON virtual_keys(key_hash);
@@ -103,6 +112,7 @@ class VirtualKey:
     key_prefix: str
     budget_usd: float | None
     spent_usd: float
+    reserved_usd: float
     rpm: int | None
     tpm: int | None
     allowed_models: list[str]
@@ -112,9 +122,10 @@ class VirtualKey:
 
     @property
     def budget_remaining_usd(self) -> float | None:
+        """What is left after spend and after everything currently in flight."""
         if self.budget_usd is None:
             return None
-        return max(0.0, self.budget_usd - self.spent_usd)
+        return max(0.0, self.budget_usd - self.spent_usd - self.reserved_usd)
 
     def is_expired(self, now: datetime | None = None) -> bool:
         if self.expires_at is None:
@@ -133,6 +144,7 @@ class VirtualKey:
             "key_prefix": self.key_prefix,
             "budget_usd": self.budget_usd,
             "spent_usd": round(self.spent_usd, 6),
+            "reserved_usd": round(self.reserved_usd, 6),
             "budget_remaining_usd": (
                 None if self.budget_remaining_usd is None
                 else round(self.budget_remaining_usd, 6)
@@ -153,6 +165,7 @@ def _row_to_key(row: sqlite3.Row) -> VirtualKey:
         key_prefix=row["key_prefix"],
         budget_usd=row["budget_usd"],
         spent_usd=row["spent_usd"],
+        reserved_usd=row["reserved_usd"],
         rpm=row["rpm"],
         tpm=row["tpm"],
         allowed_models=json.loads(row["allowed_models"]),
@@ -222,6 +235,21 @@ class Store:
         with self._conn() as conn:
             conn.executescript(SCHEMA)
 
+            # Databases created before reservations existed are missing the
+            # column. Adding it is the whole migration.
+            columns = {r["name"] for r in conn.execute("PRAGMA table_info(virtual_keys)")}
+            if "reserved_usd" not in columns:
+                conn.execute(
+                    "ALTER TABLE virtual_keys ADD COLUMN reserved_usd REAL NOT NULL DEFAULT 0.0"
+                )
+
+            # No request can be in flight at startup, so any reservation on disk
+            # is a leak from a process that died mid-request. Clearing them here
+            # is what stops a crash from permanently shrinking a key's budget.
+            # Note this assumes one gateway process per database file, which is
+            # the documented topology for the SQLite backend.
+            conn.execute("UPDATE virtual_keys SET reserved_usd = 0.0 WHERE reserved_usd != 0.0")
+
     # ── keys ─────────────────────────────────────────────────────────────
 
     def _create_key(
@@ -241,6 +269,7 @@ class Store:
             key_prefix=secret[:_PREFIX_DISPLAY_LEN],
             budget_usd=budget_usd,
             spent_usd=0.0,
+            reserved_usd=0.0,
             rpm=rpm,
             tpm=tpm,
             allowed_models=allowed_models,
@@ -319,6 +348,103 @@ class Store:
     async def set_enabled(self, key_id: str, enabled: bool) -> bool:
         return await asyncio.to_thread(self._set_enabled, key_id, enabled)
 
+    # ── gateway settings ─────────────────────────────────────────────────
+    # Synchronous on purpose: these run at startup and from the CLI, before
+    # there is an event loop to hand work to.
+
+    def get_setting(self, name: str) -> str | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT value FROM gateway_settings WHERE name = ?", (name,)
+            ).fetchone()
+        return row["value"] if row else None
+
+    def set_setting(self, name: str, value: str) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO gateway_settings (name, value) VALUES (?, ?) "
+                "ON CONFLICT(name) DO UPDATE SET value = excluded.value",
+                (name, value),
+            )
+
+    def ensure_admin_token(self) -> tuple[str, bool]:
+        """Return the stored admin token, creating one the first time.
+
+        Generating a fresh token on every start and printing it once meant that
+        missing one log line locked you out of your own dashboard, and that the
+        token you wrote down stopped working after a restart. Persisting it
+        makes it something you can look up later with `stormdoor admin-token`.
+
+        Returns ``(token, created)`` so the caller can tell a first run from
+        an ordinary one.
+        """
+        existing = self.get_setting("admin_token")
+        if existing:
+            return existing, False
+        token = secrets.token_hex(16)
+        self.set_setting("admin_token", token)
+        return token, True
+
+    # ── budget reservations ──────────────────────────────────────────────
+
+    def _reserve(self, key_id: str, amount: float) -> tuple[bool, float, float]:
+        """Claim ``amount`` of a key's remaining budget, atomically.
+
+        Reading the spend and then deciding is a check-then-act race: sixty
+        requests arriving together each read the same spend and each conclude
+        there is room. Measured on this codebase, that let a $0.20 key spend
+        $1.50, a 650% overshoot, which is not a rounding error, it is a
+        different number.
+
+        The read and the claim happen inside one ``BEGIN IMMEDIATE``
+        transaction, which SQLite serialises against every other writer, so
+        concurrent callers queue rather than race. Returns
+        ``(granted, spent, committed)`` where ``committed`` is spend plus
+        everything currently reserved, so a refusal can explain itself.
+        """
+        conn = self._connection()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT budget_usd, spent_usd, reserved_usd FROM virtual_keys WHERE id = ?",
+                (key_id,),
+            ).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                return False, 0.0, 0.0
+
+            budget, spent, reserved = row["budget_usd"], row["spent_usd"], row["reserved_usd"]
+            committed = spent + reserved
+
+            if budget is not None and committed + amount > budget:
+                conn.execute("ROLLBACK")
+                return False, spent, committed
+
+            conn.execute(
+                "UPDATE virtual_keys SET reserved_usd = reserved_usd + ? WHERE id = ?",
+                (amount, key_id),
+            )
+            conn.execute("COMMIT")
+            return True, spent, committed
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    async def reserve(self, key_id: str, amount: float) -> tuple[bool, float, float]:
+        return await asyncio.to_thread(self._reserve, key_id, amount)
+
+    def _release(self, key_id: str, amount: float) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE virtual_keys SET reserved_usd = MAX(0.0, reserved_usd - ?) WHERE id = ?",
+                (amount, key_id),
+            )
+
+    async def release(self, key_id: str, amount: float) -> None:
+        """Give back a reservation that will never be spent."""
+        if amount:
+            await asyncio.to_thread(self._release, key_id, amount)
+
     # ── usage ────────────────────────────────────────────────────────────
 
     def _record_usage(
@@ -339,6 +465,7 @@ class Store:
         ttft_ms: int | None,
         streamed: bool,
         chaos_fault: str | None,
+        reservation: float = 0.0,
     ) -> None:
         with self._conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -356,10 +483,17 @@ class Store:
                         latency_ms, ttft_ms, int(streamed), chaos_fault,
                     ),
                 )
-                if cost_usd:
+                # Turning the reservation into real spend has to be one step.
+                # Releasing separately would leave a window where the money is
+                # neither reserved nor spent, and a request arriving in that
+                # window would be admitted against a budget that is not there.
+                if cost_usd or reservation:
                     conn.execute(
-                        "UPDATE virtual_keys SET spent_usd = spent_usd + ? WHERE id = ?",
-                        (cost_usd, key_id),
+                        """UPDATE virtual_keys
+                              SET spent_usd    = spent_usd + ?,
+                                  reserved_usd = MAX(0.0, reserved_usd - ?)
+                            WHERE id = ?""",
+                        (cost_usd, reservation, key_id),
                     )
                 conn.execute("COMMIT")
             except Exception:
@@ -428,23 +562,90 @@ class Store:
 
     # ── whole-gateway views, for the dashboard ───────────────────────────
 
-    def _recent_ledger(self, limit: int) -> list[dict]:
+    def _recent_ledger(self, limit: int, day: str | None) -> list[dict]:
+        sql = """SELECT u.ts, u.request_id, u.model, u.provider, u.status, u.error_code,
+                        u.input_tokens, u.output_tokens, u.cost_usd, u.pricing_known,
+                        u.latency_ms, u.ttft_ms, u.streamed, u.chaos_fault,
+                        k.name AS key_name, k.id AS key_id
+                 FROM usage_records u
+                 JOIN virtual_keys k ON k.id = u.key_id"""
+        params: list = []
+        if day:
+            # substr rather than date(): timestamps are stored as ISO-8601 with
+            # an offset, and the first ten characters are the calendar day.
+            sql += " WHERE substr(u.ts, 1, 10) = ?"
+            params.append(day)
+        sql += " ORDER BY u.rowid DESC LIMIT ?"
+        params.append(limit)
+
         with self._conn() as conn:
-            rows = conn.execute(
-                """SELECT u.ts, u.request_id, u.model, u.provider, u.status, u.error_code,
-                          u.input_tokens, u.output_tokens, u.cost_usd, u.pricing_known,
-                          u.latency_ms, u.ttft_ms, u.streamed, u.chaos_fault,
-                          k.name AS key_name, k.id AS key_id
-                   FROM usage_records u
-                   JOIN virtual_keys k ON k.id = u.key_id
-                   ORDER BY u.rowid DESC LIMIT ?""",
-                (limit,),
-            ).fetchall()
+            rows = conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
 
-    async def recent_ledger(self, limit: int = 50) -> list[dict]:
-        """The last N requests across every key, newest first."""
-        return await asyncio.to_thread(self._recent_ledger, limit)
+    async def recent_ledger(self, limit: int = 50, day: str | None = None) -> list[dict]:
+        """The last N requests across every key, newest first.
+
+        ``day`` narrows to one calendar day, ``YYYY-MM-DD``, so the dashboard can
+        answer "what did we actually run on the day that cost the most".
+        """
+        return await asyncio.to_thread(self._recent_ledger, limit, day)
+
+    def _spend_by_day(self, days: int) -> list[dict]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                """SELECT substr(ts, 1, 10)                    AS day,
+                          COALESCE(SUM(cost_usd), 0.0)         AS cost_usd,
+                          COUNT(*)                             AS requests,
+                          COALESCE(SUM(input_tokens), 0)       AS input_tokens,
+                          COALESCE(SUM(output_tokens), 0)      AS output_tokens,
+                          SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END)      AS ok,
+                          SUM(CASE WHEN status = 'refused' THEN 1 ELSE 0 END) AS refused,
+                          SUM(CASE WHEN status IN ('error','aborted') THEN 1 ELSE 0 END)
+                                                               AS failed
+                   FROM usage_records
+                   GROUP BY day
+                   ORDER BY day DESC
+                   LIMIT ?""",
+                (days,),
+            ).fetchall()
+        # Oldest first, so the chart reads left to right like a calendar.
+        return [
+            {
+                "day": r["day"],
+                "cost_usd": round(r["cost_usd"], 6),
+                "requests": r["requests"],
+                "input_tokens": r["input_tokens"],
+                "output_tokens": r["output_tokens"],
+                "ok": r["ok"] or 0,
+                "refused": r["refused"] or 0,
+                "failed": r["failed"] or 0,
+            }
+            for r in reversed(rows)
+        ]
+
+    async def spend_by_day(self, days: int = 14) -> list[dict]:
+        """Daily spend, newest last. Days are UTC, matching how rows are stamped."""
+        return await asyncio.to_thread(self._spend_by_day, days)
+
+    def _spend_by_day_and_key(self, day: str) -> list[dict]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                """SELECT k.name AS key_name,
+                          COALESCE(SUM(u.cost_usd), 0.0) AS cost_usd,
+                          COUNT(*) AS requests
+                   FROM usage_records u
+                   JOIN virtual_keys k ON k.id = u.key_id
+                   WHERE substr(u.ts, 1, 10) = ?
+                   GROUP BY u.key_id
+                   ORDER BY cost_usd DESC""",
+                (day,),
+            ).fetchall()
+        return [{"key_name": r["key_name"], "cost_usd": round(r["cost_usd"], 6),
+                 "requests": r["requests"]} for r in rows]
+
+    async def spend_for_day(self, day: str) -> list[dict]:
+        """Which keys spent the money on one particular day."""
+        return await asyncio.to_thread(self._spend_by_day_and_key, day)
 
     def _totals(self) -> dict:
         with self._conn() as conn:

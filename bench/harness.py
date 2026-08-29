@@ -413,9 +413,10 @@ class Bench:
         )
         result.note = (
             "Refusal happens before the provider is called, so a request that would break "
-            "the budget costs nothing but a SQLite write. Sequentially, against a provider "
-            "whose token count the local estimate matches exactly, the ceiling holds. See "
-            "the overshoot note below for where it does not."
+            "the budget costs nothing but a SQLite write. The ceiling holds under concurrency "
+            "too, because admission claims the worst case atomically rather than reading a "
+            "spend figure other in-flight requests are about to change. See the note below "
+            "for the one case where it can still be beaten."
         )
         return result
 
@@ -484,15 +485,21 @@ def render(results: list[Result]) -> str:
     lines.append("### Where the budget ceiling does not hold")
     lines.append("")
     lines.append(
-        "Two honest limits, both worth stating because a guarantee with unstated "
-        "conditions is a lie with good manners. First, admission prices the prompt with a "
-        "local heuristic of about four characters per token, and that heuristic undershoots "
-        "on code, CJK text and base64, so a real provider can bill more input than was "
-        "estimated. Second, admission reads the spend recorded so far, so N requests in "
-        "flight at once can each be admitted against the same remaining budget. The "
-        "overshoot is bounded by the estimation error plus the worst-case cost of the "
-        "in-flight requests. Reserving budget at admission and settling it afterwards "
-        "closes the second gap, and is week 4's work."
+        "One honest limit, worth stating because a guarantee with unstated conditions is a "
+        "lie with good manners. Admission prices the prompt with a local heuristic of about "
+        "four characters per token, and that heuristic undershoots on code, CJK text and "
+        "base64, so a real provider can bill more input than was estimated. The overshoot "
+        "is bounded by that estimation error on a single request."
+    )
+    lines.append("")
+    lines.append(
+        "The larger gap is closed. Admission used to read the spend and then decide, which "
+        "is a check-then-act race: `bench/stress.py` fired sixty requests at a $0.20 key at "
+        "once and watched it spend $1.50, a 650% overshoot. Admission now claims the worst "
+        "case atomically before the call and settles it against the real cost afterwards, "
+        "in the same transaction as the ledger row. The same drill now overshoots by $0.00. "
+        "A crash mid-request would strand a claim, so every reservation on disk is cleared "
+        "at startup, when by definition nothing is in flight."
     )
     return "\n".join(lines)
 

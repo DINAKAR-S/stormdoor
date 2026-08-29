@@ -110,6 +110,42 @@ def keys_disable(key_id: str) -> None:
     typer.echo(f"{key_id} disabled")
 
 
+@cli.command("admin-token")
+def admin_token(
+    reset: bool = typer.Option(False, "--reset", help="Replace it with a new one."),
+) -> None:
+    """Print the token that signs you in to the dashboard.
+
+    This is the answer to "where do I find the token". It is stored beside the
+    keys and does not change when the gateway restarts.
+    """
+    settings = get_settings()
+
+    if settings.admin_token:
+        typer.secho("Set by STORMDOOR_ADMIN_TOKEN in the environment:",
+                    fg=typer.colors.YELLOW)
+        typer.secho(settings.admin_token, fg=typer.colors.GREEN, bold=True)
+        typer.echo("\nThe stored token is ignored while that variable is set.")
+        raise typer.Exit()
+
+    store = _store(settings)
+    if reset:
+        import secrets as _secrets
+
+        new = _secrets.token_hex(16)
+        store.set_setting("admin_token", new)
+        typer.secho("New admin token, the previous one no longer works:",
+                    fg=typer.colors.YELLOW)
+        typer.secho(new, fg=typer.colors.GREEN, bold=True)
+        raise typer.Exit()
+
+    token, created = store.ensure_admin_token()
+    typer.secho("Generated and stored:" if created else "Admin token:",
+                fg=typer.colors.YELLOW)
+    typer.secho(token, fg=typer.colors.GREEN, bold=True)
+    typer.echo(f"\nStored in {settings.db_path}. Sign in at http://{settings.host}:{settings.port}")
+
+
 @cli.command("pricing")
 def pricing(
     file: Path | None = typer.Option(None, help="A pricing override file to inspect."),

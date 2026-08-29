@@ -91,6 +91,27 @@ client, change two things and nothing else:
 Because stormdoor speaks the OpenAI API, no other code changes. The project
 keeps calling `chat.completions.create` exactly as before.
 
+### What to put in the model field
+
+The same thing you put there today. `gpt-4o-mini` stays `gpt-4o-mini`. There is
+no prefix to add and no renaming to do, because model ids route by prefix:
+`gpt-`, `o1`, `o3`, `o4` and `chatgpt-` go to OpenAI, `claude-` goes to
+Anthropic, `echo-` is the local test model.
+
+If you would rather be explicit, or you are pointing
+`STORMDOOR_OPENAI_BASE_URL` at a local vLLM or Ollama server whose model is
+named something the prefix rules would never guess, write
+`<provider>/<model>` instead:
+
+```json
+{ "model": "openai/gpt-4o-mini" }
+{ "model": "anthropic/claude-opus-5" }
+{ "model": "openai/llama-3.1-70b" }
+```
+
+Both spellings work, the prefix is stripped before the call, and the README has
+the full table under "Naming a model".
+
 ---
 
 ## 3. Wire n8n into it
@@ -156,13 +177,13 @@ Put a reverse proxy in front that exposes **only** the caller-facing routes and
 terminates TLS. With Caddy:
 
 ```caddyfile
-# Caddyfile — exposes only /v1 and /healthz to the world.
+# Caddyfile: exposes only /v1 and /healthz to the world.
 llm.your-domain.com {
     @public path /v1/* /healthz
     handle @public {
         reverse_proxy 127.0.0.1:8080
     }
-    # Everything else — /admin, /dashboard — is not served publicly.
+    # Everything else, /admin and /dashboard included, is not served publicly.
     handle {
         respond "not found" 404
     }
@@ -175,6 +196,21 @@ Reach the dashboard yourself over an SSH tunnel instead of exposing it:
 ssh -L 8080:127.0.0.1:8080 you@your-vps
 # then open http://localhost:8080/dashboard on your laptop
 ```
+
+### Where the dashboard token comes from
+
+The sign-in token is whatever you put in `STORMDOOR_ADMIN_TOKEN`. If you leave
+that unset, the gateway generates one on first start and stores it next to the
+keys, so it survives restarts. Either way, ask it:
+
+```bash
+docker compose exec stormdoor stormdoor admin-token
+```
+
+Add `--reset` to replace a stored token, which is what to do if it ever leaks.
+Setting `STORMDOOR_ADMIN_TOKEN` overrides the stored one, and for a real
+deployment that is the better habit, because then the token lives in your `.env`
+with the rest of your secrets rather than only inside the database.
 
 Checklist before you call it done:
 
