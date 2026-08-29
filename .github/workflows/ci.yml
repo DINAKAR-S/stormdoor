@@ -21,19 +21,34 @@ jobs:
         uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
+          cache-dependency-glob: pyproject.toml
+
+      # Into a venv, not --system. The runner's system Python is externally
+      # managed and refuses the write, and --system would have quietly ignored
+      # the matrix version anyway, so every job would have tested one Python.
+      - name: Create the environment
+        run: uv venv --python ${{ matrix.python }}
 
       - name: Install
-        run: uv pip install --system -e ".[dev]"
+        run: uv pip install -e ".[dev]"
+
+      - name: Check the Python actually under test
+        run: uv run python -c "import sys; print(sys.version)"
 
       - name: Lint
-        run: ruff check src tests bench
+        run: uv run ruff check src tests bench
 
       - name: Test
-        run: pytest -q
+        run: uv run pytest -q
 
   # The reliability claims in the README come from this harness, so it has to
   # keep running. It needs no API key and no network: every drill runs against
   # the local echo provider.
+  #
+  # Timings differ on every machine and are never asserted. The invariants
+  # behind them are: no overspend, every injected failure marked retryable,
+  # every killed stream recorded as aborted rather than as a success. The
+  # harness exits non-zero if any of those stop holding.
   bench:
     runs-on: ubuntu-latest
     steps:
@@ -43,13 +58,13 @@ jobs:
         uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
+          cache-dependency-glob: pyproject.toml
+
+      - name: Create the environment
+        run: uv venv --python 3.12
 
       - name: Install
-        run: uv pip install --system -e ".[dev]"
+        run: uv pip install -e ".[dev]"
 
-      # Timings differ on every machine, so the numbers are not asserted. The
-      # invariants behind them are: no overspend, every injected failure marked
-      # retryable, every killed stream recorded as aborted rather than as a
-      # success. The harness exits non-zero if any of those stop holding.
       - name: Run the proof harness
-        run: python -m bench.harness
+        run: uv run python -m bench.harness
