@@ -173,6 +173,11 @@
     <button class="link" id="sign-out">Forget token</button>
   </header>
 
+  <!-- Shown when the gateway stops answering. Without it the page keeps
+       displaying the last numbers it saw, which is the worst thing a
+       monitoring view can do: look fine while the thing it monitors is down. -->
+  <div id="conn" class="notice err" hidden></div>
+
   <div class="tiles" id="tiles"></div>
 
   <div class="cols">
@@ -516,10 +521,28 @@ async function refresh() {
   renderLedger(ledger.data);
 }
 
+let lastGood = null;
+
 async function tick() {
   if (paused) return;
-  try { await refresh(); }
-  catch (err) { if (err.status === 401) showGate("That token was not accepted."); }
+  try {
+    await refresh();
+    lastGood = new Date();
+    el("conn").hidden = true;
+  } catch (err) {
+    if (err.status === 401) {
+      showGate("That token was not accepted.");
+      return;
+    }
+    // Anything else means the gateway is not answering. Say so on the page.
+    // Everything below this banner is now history, not status.
+    el("conn").hidden = false;
+    el("conn").innerHTML =
+      `Cannot reach the gateway (${esc(err.message)}). Still trying every 4 seconds. ` +
+      (lastGood
+        ? `The numbers below are from ${esc(lastGood.toLocaleTimeString())} and are no longer live.`
+        : `Nothing has loaded yet.`);
+  }
 }
 
 function start() {

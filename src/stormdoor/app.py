@@ -22,12 +22,12 @@ from pathlib import Path
 from fastapi import Depends, FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from .chaos import HEADER as CHAOS_HEADER
 from .chaos import ChaosGate, parse_spec
 from .config import Settings, get_settings
-from .errors import AuthError, BadRequest, StormdoorError
+from .errors import AuthError, BadRequest, StormdoorError, UnknownModel
 from .gateway import Gateway
 from .limits import build_limiter
 from .pricing import PriceBook
@@ -51,6 +51,16 @@ class CreateKeyBody(BaseModel):
     tpm: int | None = Field(default=None, ge=1)
     allowed_models: list[str] = Field(default_factory=list)
     expires_at: str | None = None
+
+    @field_validator("name")
+    @classmethod
+    def _name_is_not_only_whitespace(cls, value: str) -> str:
+        # min_length counts "   " as three characters, and a key whose name
+        # renders as an empty cell in the dashboard cannot be identified later.
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("name cannot be blank")
+        return stripped
 
 
 class DrillBody(BaseModel):
@@ -292,7 +302,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         try:
             admission = await gateway.admit(key, req)
+        except UnknownModel:
+            # Not a drill outcome. A model this gateway cannot route is a
+            # mistake in the request, so it gets a real error status rather
+            # than a 200 describing a refusal that never happened.
+            raise
         except StormdoorError as err:
+            # A budget, rate or permission refusal IS the result being
+            # demonstrated, so it comes back as a 200 the dashboard can render.
             ctx.chaos_fault = chaos.label
             await gateway.record_refusal(key, ctx, req, err)
             return {
