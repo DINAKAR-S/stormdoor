@@ -1,0 +1,427 @@
+"""Virtual keys and the usage ledger, on SQLite.
+
+SQLite is the default on purpose. The gateway has to run for someone who just
+cloned the repo, with no Docker daemon, no Postgres and no Redis, or the
+failure demos never get run. The access pattern here is small writes and
+point lookups, which SQLite in WAL mode handles well past the scale at which
+you would have moved to Postgres for other reasons anyway.
+
+Two tables:
+
+``virtual_keys``   one row per issued key. The secret is never stored, only its
+                   SHA-256. ``spent_usd`` is a running total kept in step with
+                   the ledger inside one transaction, so admission checks are a
+                   single indexed read rather than an aggregate over history.
+
+``usage_records``  append-only. One row per request, successful or not,
+                   including requests refused at the door and requests killed
+                   by an injected fault. Rows are never updated or deleted,
+                   because a ledger you can edit is not a ledger.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import hashlib
+import json
+import secrets
+import sqlite3
+import threading
+import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+
+KEY_PREFIX = "sd-"
+_PREFIX_DISPLAY_LEN = 11  # "sd-" + 8 hex, enough to recognise a key, useless as a credential
+
+SCHEMA = """
+PRAGMA journal_mode=WAL;
+PRAGMA foreign_keys=ON;
+
+CREATE TABLE IF NOT EXISTS virtual_keys (
+    id             TEXT PRIMARY KEY,
+    name           TEXT NOT NULL,
+    key_hash       TEXT NOT NULL UNIQUE,
+    key_prefix     TEXT NOT NULL,
+    budget_usd     REAL,
+    spent_usd      REAL NOT NULL DEFAULT 0.0,
+    rpm            INTEGER,
+    tpm            INTEGER,
+    allowed_models TEXT NOT NULL DEFAULT '[]',
+    enabled        INTEGER NOT NULL DEFAULT 1,
+    created_at     TEXT NOT NULL,
+    expires_at     TEXT
+);
+
+CREATE TABLE IF NOT EXISTS usage_records (
+    id                  TEXT PRIMARY KEY,
+    key_id              TEXT NOT NULL,
+    request_id          TEXT NOT NULL,
+    ts                  TEXT NOT NULL,
+    model               TEXT NOT NULL,
+    provider            TEXT NOT NULL,
+    input_tokens        INTEGER NOT NULL DEFAULT 0,
+    output_tokens       INTEGER NOT NULL DEFAULT 0,
+    cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_usd            REAL NOT NULL DEFAULT 0.0,
+    pricing_known       INTEGER NOT NULL DEFAULT 1,
+    status              TEXT NOT NULL,
+    error_code          TEXT,
+    latency_ms          INTEGER,
+    ttft_ms             INTEGER,
+    streamed            INTEGER NOT NULL DEFAULT 0,
+    chaos_fault         TEXT,
+    FOREIGN KEY (key_id) REFERENCES virtual_keys(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_usage_key_ts   ON usage_records(key_id, ts);
+CREATE INDEX IF NOT EXISTS idx_usage_request  ON usage_records(request_id);
+CREATE INDEX IF NOT EXISTS idx_keys_hash      ON virtual_keys(key_hash);
+"""
+
+
+def _now() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def hash_secret(secret: str) -> str:
+    return hashlib.sha256(secret.encode("utf-8")).hexdigest()
+
+
+def generate_secret() -> str:
+    return KEY_PREFIX + secrets.token_hex(20)
+
+
+@dataclass(slots=True)
+class VirtualKey:
+    id: str
+    name: str
+    key_prefix: str
+    budget_usd: float | None
+    spent_usd: float
+    rpm: int | None
+    tpm: int | None
+    allowed_models: list[str]
+    enabled: bool
+    created_at: str
+    expires_at: str | None
+
+    @property
+    def budget_remaining_usd(self) -> float | None:
+        if self.budget_usd is None:
+            return None
+        return max(0.0, self.budget_usd - self.spent_usd)
+
+    def is_expired(self, now: datetime | None = None) -> bool:
+        if self.expires_at is None:
+            return False
+        now = now or datetime.now(UTC)
+        return datetime.fromisoformat(self.expires_at) <= now
+
+    def allows_model(self, model: str) -> bool:
+        # An empty allow-list means every model the gateway can route.
+        return not self.allowed_models or model in self.allowed_models
+
+    def public(self) -> dict:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "key_prefix": self.key_prefix,
+            "budget_usd": self.budget_usd,
+            "spent_usd": round(self.spent_usd, 6),
+            "budget_remaining_usd": (
+                None if self.budget_remaining_usd is None
+                else round(self.budget_remaining_usd, 6)
+            ),
+            "rpm": self.rpm,
+            "tpm": self.tpm,
+            "allowed_models": self.allowed_models,
+            "enabled": self.enabled,
+            "created_at": self.created_at,
+            "expires_at": self.expires_at,
+        }
+
+
+def _row_to_key(row: sqlite3.Row) -> VirtualKey:
+    return VirtualKey(
+        id=row["id"],
+        name=row["name"],
+        key_prefix=row["key_prefix"],
+        budget_usd=row["budget_usd"],
+        spent_usd=row["spent_usd"],
+        rpm=row["rpm"],
+        tpm=row["tpm"],
+        allowed_models=json.loads(row["allowed_models"]),
+        enabled=bool(row["enabled"]),
+        created_at=row["created_at"],
+        expires_at=row["expires_at"],
+    )
+
+
+class Store:
+    """SQLite-backed key and usage store.
+
+    Every public method is async and runs the blocking call on a worker thread,
+    so a slow disk cannot stall the event loop. Connections are cached per
+    thread rather than opened per operation, which sidesteps SQLite's
+    thread-affinity rules and, as the bench harness showed, is worth roughly
+    five times the throughput.
+    """
+
+    def __init__(self, path: Path | str):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._local = threading.local()
+        self._open: list[sqlite3.Connection] = []
+        self._open_lock = threading.Lock()
+        self._init_schema()
+
+    def _connection(self) -> sqlite3.Connection:
+        """One connection per worker thread, reused for the life of the process.
+
+        Opening a connection per operation cost more than the operation: the
+        first bench run measured 88 requests a second against a provider that
+        does no I/O at all, and the time was going into connect and close, not
+        into SQL. Connections are cached per thread because SQLite objects have
+        thread affinity, and tracked centrally so ``close`` can reach them.
+        """
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(
+                self.path, timeout=10.0, isolation_level=None, check_same_thread=False
+            )
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            # WAL already gives durability across process crashes. NORMAL trades
+            # the last few writes on a host power loss for a large write speedup,
+            # which is the right trade for a usage ledger.
+            conn.execute("PRAGMA synchronous=NORMAL")
+            self._local.conn = conn
+            with self._open_lock:
+                self._open.append(conn)
+        return conn
+
+    @contextmanager
+    def _conn(self) -> Iterator[sqlite3.Connection]:
+        yield self._connection()
+
+    def close(self) -> None:
+        """Close every connection this store opened, from any thread."""
+        with self._open_lock:
+            for conn in self._open:
+                with contextlib.suppress(sqlite3.Error):  # already closed is fine
+                    conn.close()
+            self._open.clear()
+        self._local = threading.local()
+
+    def _init_schema(self) -> None:
+        with self._conn() as conn:
+            conn.executescript(SCHEMA)
+
+    # ── keys ─────────────────────────────────────────────────────────────
+
+    def _create_key(
+        self,
+        *,
+        name: str,
+        budget_usd: float | None,
+        rpm: int | None,
+        tpm: int | None,
+        allowed_models: list[str],
+        expires_at: str | None,
+    ) -> tuple[VirtualKey, str]:
+        secret = generate_secret()
+        key = VirtualKey(
+            id=f"key_{uuid.uuid4().hex[:16]}",
+            name=name,
+            key_prefix=secret[:_PREFIX_DISPLAY_LEN],
+            budget_usd=budget_usd,
+            spent_usd=0.0,
+            rpm=rpm,
+            tpm=tpm,
+            allowed_models=allowed_models,
+            enabled=True,
+            created_at=_now(),
+            expires_at=expires_at,
+        )
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO virtual_keys
+                   (id, name, key_hash, key_prefix, budget_usd, spent_usd, rpm, tpm,
+                    allowed_models, enabled, created_at, expires_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    key.id, key.name, hash_secret(secret), key.key_prefix,
+                    key.budget_usd, 0.0, key.rpm, key.tpm,
+                    json.dumps(key.allowed_models), 1, key.created_at, key.expires_at,
+                ),
+            )
+        return key, secret
+
+    async def create_key(
+        self,
+        *,
+        name: str,
+        budget_usd: float | None = None,
+        rpm: int | None = None,
+        tpm: int | None = None,
+        allowed_models: list[str] | None = None,
+        expires_at: str | None = None,
+    ) -> tuple[VirtualKey, str]:
+        """Create a key. The plaintext secret is returned once and never stored."""
+        return await asyncio.to_thread(
+            self._create_key,
+            name=name,
+            budget_usd=budget_usd,
+            rpm=rpm,
+            tpm=tpm,
+            allowed_models=allowed_models or [],
+            expires_at=expires_at,
+        )
+
+    def _key_by_secret(self, secret: str) -> VirtualKey | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM virtual_keys WHERE key_hash = ?", (hash_secret(secret),)
+            ).fetchone()
+        return _row_to_key(row) if row else None
+
+    async def key_by_secret(self, secret: str) -> VirtualKey | None:
+        return await asyncio.to_thread(self._key_by_secret, secret)
+
+    def _key_by_id(self, key_id: str) -> VirtualKey | None:
+        with self._conn() as conn:
+            row = conn.execute("SELECT * FROM virtual_keys WHERE id = ?", (key_id,)).fetchone()
+        return _row_to_key(row) if row else None
+
+    async def key_by_id(self, key_id: str) -> VirtualKey | None:
+        return await asyncio.to_thread(self._key_by_id, key_id)
+
+    def _list_keys(self) -> list[VirtualKey]:
+        with self._conn() as conn:
+            rows = conn.execute("SELECT * FROM virtual_keys ORDER BY created_at DESC").fetchall()
+        return [_row_to_key(r) for r in rows]
+
+    async def list_keys(self) -> list[VirtualKey]:
+        return await asyncio.to_thread(self._list_keys)
+
+    def _set_enabled(self, key_id: str, enabled: bool) -> bool:
+        with self._conn() as conn:
+            cur = conn.execute(
+                "UPDATE virtual_keys SET enabled = ? WHERE id = ?", (int(enabled), key_id)
+            )
+        return cur.rowcount > 0
+
+    async def set_enabled(self, key_id: str, enabled: bool) -> bool:
+        return await asyncio.to_thread(self._set_enabled, key_id, enabled)
+
+    # ── usage ────────────────────────────────────────────────────────────
+
+    def _record_usage(
+        self,
+        *,
+        key_id: str,
+        request_id: str,
+        model: str,
+        provider: str,
+        input_tokens: int,
+        output_tokens: int,
+        cached_input_tokens: int,
+        cost_usd: float,
+        pricing_known: bool,
+        status: str,
+        error_code: str | None,
+        latency_ms: int | None,
+        ttft_ms: int | None,
+        streamed: bool,
+        chaos_fault: str | None,
+    ) -> None:
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    """INSERT INTO usage_records
+                       (id, key_id, request_id, ts, model, provider, input_tokens,
+                        output_tokens, cached_input_tokens, cost_usd, pricing_known,
+                        status, error_code, latency_ms, ttft_ms, streamed, chaos_fault)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        f"use_{uuid.uuid4().hex[:16]}", key_id, request_id, _now(),
+                        model, provider, input_tokens, output_tokens, cached_input_tokens,
+                        cost_usd, int(pricing_known), status, error_code,
+                        latency_ms, ttft_ms, int(streamed), chaos_fault,
+                    ),
+                )
+                if cost_usd:
+                    conn.execute(
+                        "UPDATE virtual_keys SET spent_usd = spent_usd + ? WHERE id = ?",
+                        (cost_usd, key_id),
+                    )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+    async def record_usage(self, **kwargs) -> None:
+        """Append one ledger row and move the running spend, in one transaction."""
+        await asyncio.to_thread(self._record_usage, **kwargs)
+
+    def _usage_summary(self, key_id: str, limit: int) -> dict:
+        with self._conn() as conn:
+            totals = conn.execute(
+                """SELECT COUNT(*)                AS requests,
+                          COALESCE(SUM(input_tokens), 0)  AS input_tokens,
+                          COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                          COALESCE(SUM(cost_usd), 0.0)    AS cost_usd,
+                          SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END)      AS ok,
+                          SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END)   AS errors,
+                          SUM(CASE WHEN status = 'aborted' THEN 1 ELSE 0 END) AS aborted,
+                          SUM(CASE WHEN status = 'refused' THEN 1 ELSE 0 END) AS refused,
+                          SUM(CASE WHEN pricing_known = 0 THEN 1 ELSE 0 END)  AS unpriced
+                   FROM usage_records WHERE key_id = ?""",
+                (key_id,),
+            ).fetchone()
+            recent = conn.execute(
+                """SELECT ts, model, provider, status, error_code, input_tokens,
+                          output_tokens, cost_usd, latency_ms, ttft_ms, streamed, chaos_fault
+                   FROM usage_records WHERE key_id = ?
+                   ORDER BY ts DESC, rowid DESC LIMIT ?""",
+                (key_id, limit),
+            ).fetchall()
+        return {
+            "totals": {
+                "requests": totals["requests"],
+                "ok": totals["ok"] or 0,
+                "errors": totals["errors"] or 0,
+                "aborted": totals["aborted"] or 0,
+                "refused": totals["refused"] or 0,
+                "unpriced_requests": totals["unpriced"] or 0,
+                "input_tokens": totals["input_tokens"],
+                "output_tokens": totals["output_tokens"],
+                "cost_usd": round(totals["cost_usd"], 6),
+            },
+            "recent": [dict(r) for r in recent],
+        }
+
+    async def usage_summary(self, key_id: str, limit: int = 25) -> dict:
+        return await asyncio.to_thread(self._usage_summary, key_id, limit)
+
+    def _count_records(self, key_id: str, status: str | None = None) -> int:
+        with self._conn() as conn:
+            if status is None:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS n FROM usage_records WHERE key_id = ?", (key_id,)
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS n FROM usage_records WHERE key_id = ? AND status = ?",
+                    (key_id, status),
+                ).fetchone()
+        return row["n"]
+
+    async def count_records(self, key_id: str, status: str | None = None) -> int:
+        return await asyncio.to_thread(self._count_records, key_id, status)
