@@ -32,6 +32,10 @@ ROUTES = {
             {"model": "echo-large", "tier": "deep"},
         ],
     },
+    # The docstring's "common form": a route keyed after a real model, giving
+    # the model you already call somewhere to fall back to. Exercises the
+    # allow-list boundary under failover.
+    "echo-small": {"targets": ["echo-small", "echo-large"]},
 }
 
 
@@ -153,6 +157,43 @@ async def test_a_key_restricted_to_one_model_is_never_failed_over(fo_app, fo):
         headers={"Authorization": f"Bearer {secret}"},
     )
     assert r.status_code == 403
+
+
+async def test_a_key_is_never_failed_over_onto_a_denied_model_via_a_named_route(fo_app, fo):
+    """The escalation the previous test missed.
+
+    A route keyed after a real model the key IS allowed (`echo-small`) still must
+    not smuggle a denied model (`echo-large`) in through failover. The earlier
+    test only covered a route *alias* the key was denied outright; this covers
+    the docstring's "common form", where the entry point is legitimately allowed
+    and the fallback is not. Regression for the allow-list short-circuit in
+    admit(), which waved every fallback through once the named model passed.
+    """
+    _key, secret = await fo_app.state.store.create_key(
+        name="narrow", allowed_models=["echo-small"]
+    )
+    r = await fo.post(
+        "/v1/chat/completions", json=chat_body(model="echo-small"),
+        headers={"Authorization": f"Bearer {secret}", **outage(FIRST)},
+    )
+    assert r.status_code == 403, "must refuse rather than escalate onto echo-large"
+    assert r.json()["error"]["code"] == "model_not_allowed"
+
+
+async def test_a_key_allowed_the_whole_chain_may_use_a_named_route(fo_app, fo):
+    """The other side of the boundary: allow every reachable model and it works.
+
+    Proves the fix refuses only genuine escalation, not every named-route request.
+    """
+    _key, secret = await fo_app.state.store.create_key(
+        name="wide", allowed_models=["echo-small", "echo-large"]
+    )
+    r = await fo.post(
+        "/v1/chat/completions", json=chat_body(model="echo-small"),
+        headers={"Authorization": f"Bearer {secret}", **outage(FIRST)},
+    )
+    assert r.status_code == 200
+    assert r.json()["stormdoor"]["served_by"] == SECOND
 
 
 # ── the circuit ──────────────────────────────────────────────────────────────

@@ -218,6 +218,29 @@ written to measure.
 
 ---
 
+## 14. A test can guard the wrong shape of the thing it guards
+
+There was a test called "a key restricted to one model is never failed over",
+and it passed. It made a key allowed only `echo-small`, asked for a route named
+`resilient` the key was not allowed, and asserted a 403. Green.
+
+It never once exercised the case the routing docs call the common one: a route
+keyed after a real model the key *is* allowed, `{"echo-small": {targets:
+[echo-small, echo-large]}}`. There, admission's allow-list check short-circuited
+the moment the named model passed, and failover carried the request onto
+`echo-large`, a model the key had been explicitly denied. A quiet privilege
+escalation, under a test whose name promised it could not happen.
+
+The unit test could not find it because it was asserting the boundary held for
+one route shape while the boundary was broken for another. A ship-gate probe that
+built the exact config from the docstring found it on the first request.
+
+> A passing test named after an invariant is not proof of the invariant. It is
+> proof of the one example it runs. Enumerate the shapes the feature actually
+> takes in the docs, and test the boundary on each of them.
+
+---
+
 ## The rule underneath all of these
 
 The test suite proves the code does what you thought of. Something else has to

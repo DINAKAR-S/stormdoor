@@ -151,15 +151,26 @@ class Gateway:
             provider, upstream = self.registry.resolve(target.model)
             candidates.append(Candidate(provider=provider, model=upstream))
 
-        # The allow-list is checked against what the caller asked for and against
-        # every model that could actually serve it. A key restricted to one model
-        # must not be quietly failed over onto another.
-        allowed = key.allows_model(req.model) or all(
-            key.allows_model(c.model) for c in candidates
-        )
-        if not allowed:
+        # The allow-list gates every model that could actually be contacted, not
+        # just the one the caller named. This is the whole boundary: a key
+        # restricted to one model must never be failed over onto another, because
+        # that is a quiet privilege escalation. The reachable set is exactly the
+        # chain _run_chain will walk, so it depends on whether failover is on: with
+        # it off only the first target is ever called, with it on any target in
+        # the chain can be. Checking `req.model` here instead was the bug — when
+        # a route is keyed after a real model the caller is allowed (the common
+        # `{"gpt-4o-mini": {targets: [gpt-4o-mini, claude-haiku]}}` form), that
+        # short-circuit waved every fallback through the boundary.
+        reachable = candidates if self.settings.failover_enabled else candidates[:1]
+        denied = next((c for c in reachable if not key.allows_model(c.model)), None)
+        if denied is not None:
+            named = (
+                repr(req.model)
+                if denied.model == req.model
+                else f"{req.model!r} (via {denied.model!r})"
+            )
             raise ForbiddenError(
-                f"key {key.name!r} is not allowed to use model {req.model!r}", param="model"
+                f"key {key.name!r} is not allowed to use model {named}", param="model"
             )
 
         prompt_tokens = estimate_prompt_tokens([m.text() for m in req.messages])
