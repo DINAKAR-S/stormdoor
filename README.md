@@ -25,7 +25,7 @@ this README is produced by a harness in `bench/` that you can rerun.
 > its last event id. The honest limits on each are stated plainly. See the
 > [build log](#build-log) and [what is not built yet](#what-is-not-built-yet).
 
-![The stormdoor dashboard: gateway counters and spend by day, with the most expensive day called out](docs/screenshots/dashboard.png)
+![The stormdoor dashboard: gateway counters and spend by day, with the most expensive day called out](https://raw.githubusercontent.com/DINAKAR-S/stormdoor/main/docs/screenshots/dashboard.png)
 
 Every request that goes through the gateway, what it cost, and which day cost
 the most. Click a day and everything below filters to it.
@@ -325,21 +325,21 @@ or *cap it with a budget*. Track-only keys run without a ceiling and every cent
 they spend is still recorded, which is the right setting when what you want is to
 find out what something costs before you decide what it is allowed to cost.
 
-![Creating a key, with track-only and capped modes as an explicit choice](docs/screenshots/new-key.png)
+![Creating a key, with track-only and capped modes as an explicit choice](https://raw.githubusercontent.com/DINAKAR-S/stormdoor/main/docs/screenshots/new-key.png)
 
 Keys and the live ledger side by side. The `tracking only` pill is a key with no
 ceiling, deliberately, rather than a budget somebody forgot to fill in:
 
-![The keys table and the live ledger](docs/screenshots/keys-and-ledger.png)
+![The keys table and the live ledger](https://raw.githubusercontent.com/DINAKAR-S/stormdoor/main/docs/screenshots/keys-and-ledger.png)
 
 Which key is actually costing you money, and the panel that breaks the gateway
 on purpose:
 
-![Spend ranked by key, and the fault injection panel](docs/screenshots/spend-and-drill.png)
+![Spend ranked by key, and the fault injection panel](https://raw.githubusercontent.com/DINAKAR-S/stormdoor/main/docs/screenshots/spend-and-drill.png)
 
 Latency of recent requests, coloured by what happened to each one:
 
-![A latency strip coloured by request outcome](docs/screenshots/latency.png)
+![A latency strip coloured by request outcome](https://raw.githubusercontent.com/DINAKAR-S/stormdoor/main/docs/screenshots/latency.png)
 
 ---
 
