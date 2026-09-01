@@ -17,13 +17,13 @@ nobody tests, because provoking a real 503 or a real mid-stream disconnect is
 inconvenient. So stormdoor injects them for you, and every reliability claim in
 this README is produced by a harness in `bench/` that you can rerun.
 
-> **Status: week 3 of a public build, and honest about it.** What works and is tested: providers,
+> **Status: week 4 of a public build, and honest about it.** What works and is tested: providers,
 > streaming, virtual keys, budgets, rate limits, fault injection, the ledger, the
 > dashboard, routing with retries, circuit breaking and failover, a semantic cache,
-> and guardrail hooks for PII redaction and prompt-injection filtering. Tracing and
-> mid-stream resume are not there, and the honest limits on the cache and the
-> guardrails are stated plainly. See the [build log](#build-log) and
-> [what is not built yet](#what-is-not-built-yet).
+> guardrail hooks for PII redaction and prompt-injection filtering, OpenTelemetry
+> tracing, usage metering with a Stripe export, and resuming a dropped stream from
+> its last event id. The honest limits on each are stated plainly. See the
+> [build log](#build-log) and [what is not built yet](#what-is-not-built-yet).
 
 ![The stormdoor dashboard: gateway counters and spend by day, with the most expensive day called out](docs/screenshots/dashboard.png)
 
@@ -72,6 +72,9 @@ else is the same, because stormdoor speaks the OpenAI API.
 | You want a model you have not used before | Another SDK, another key, another code path | Same endpoint, change the model string |
 | The same question is asked a thousand times a day | You pay for a thousand identical answers | Near-repeats are served from a semantic cache, billed at nothing |
 | A user pastes a credit-card number into a prompt | It goes to the provider, and into their logs | A redaction hook strips it before the request leaves |
+| You need to bill each customer for their usage | Parse provider invoices and guess the split | Tag keys with a tenant and export usage per tenant, or push it to Stripe |
+| A user's connection drops mid-answer | They lose the whole response and pay for it again | They reconnect and resume from the last line they saw |
+| A request is slow and you cannot see why | Add logging to every app and correlate by hand | One OpenTelemetry span per request, joined to the rest of your traces |
 | The provider has a bad hour | Find out from your users | Rehearse it first, on purpose, and know what your app does |
 
 That last row is the one this project is actually about. Failover and fault
@@ -279,6 +282,31 @@ prompt-injection shapes. What a guardrail did is surfaced on the response, so a
 redaction is auditable rather than a silent change. The honest limits on both are
 in [what is not built yet](#what-is-not-built-yet), because a guardrail that
 oversells itself is worse than none.
+
+**OpenTelemetry tracing, off by default.** With it on, every request emits one
+span carrying model, provider, token counts, cost, latency and the failover
+trail, exported to your OTLP collector (or the console). Off means the OTel SDK is
+never imported and nothing is measured, so tracing costs nothing until you want
+it. **Prompt and completion text are not in the span** unless you explicitly opt
+in, because a span usually leaves the process and a gateway that redacts PII on
+the way in should not post the same text into a trace on the way out. A failing
+exporter is logged and swallowed: observability must never turn a served answer
+into a failed one.
+
+**Usage metering, per key and per tenant.** Tag keys with a tenant and roll usage
+up for billing over any window: `GET /admin/usage/export` returns requests,
+tokens and cost grouped by key or tenant, from the ledger, needing no external
+service. On top of that, an opt-in Stripe push sends the same rolled-up usage to
+Stripe billing meters. The push claims each window atomically before sending, so
+two concurrent pushes cannot both reach the meter, and a push that fails releases
+its claim so it can be retried rather than being stuck half done.
+
+**Resuming a dropped stream.** Every SSE frame carries an `id:`. If a client's
+connection dies mid-answer, it reconnects to `GET /v1/stream/{request_id}` with
+the last id it saw and gets the frames after it, reassembling the answer with no
+gap and no repeat. The frames are buffered in memory, bounded and with a TTL, and
+only the key that made the stream can resume it. This is per process and not
+shared across replicas, which the limits table states.
 
 **A dashboard, in one file.** Served at `/`, no build step, no framework, no web
 font, and no external request of any kind, which a test enforces. Gateway-wide
@@ -503,6 +531,13 @@ Everything takes a `STORMDOOR_` prefix, and `.env` is read if present.
 | `STORMDOOR_GUARDRAIL_HOOKS` | unset | Ordered chain, e.g. `pii_redact,injection_flag,pii_redact_output` |
 | `STORMDOOR_GUARDRAIL_PII_KINDS` | all | Subset of `email,phone,card,ssn,ip,key` |
 | `STORMDOOR_GUARDRAIL_INJECTION_THRESHOLD` | `1` | Distinct injection signals before a flag or block |
+| `STORMDOOR_OTEL_ENABLED` | `false` | Emit one OpenTelemetry span per request (needs the `otel` extra) |
+| `STORMDOOR_OTEL_EXPORTER_ENDPOINT` | unset | OTLP endpoint; spans go to the console if unset |
+| `STORMDOOR_OTEL_INCLUDE_CONTENT` | `false` | Put a prompt/completion preview in the span. A footgun; off by default |
+| `STORMDOOR_RESUME_ENABLED` | `false` | Buffer streams so a dropped one can resume via `Last-Event-ID` |
+| `STORMDOOR_RESUME_MAX_STREAMS` / `..._MAX_FRAMES` / `..._TTL_S` | `256` / `512` / `300` | Buffer bounds |
+| `STORMDOOR_STRIPE_API_KEY` | unset | Enables the Stripe usage push (needs the `stripe` extra) |
+| `STORMDOOR_STRIPE_CUSTOMER_MAP` / `..._METER_MAP` | unset | JSON: tenant to customer id, metric to meter event name |
 
 ### A note on `default_max_tokens`
 
@@ -533,6 +568,9 @@ more room say so in the request.
 | `POST /admin/breaker/reset` | admin | Force a target back to closed |
 | `GET /admin/cache` | admin | Cache hit ratio and configuration |
 | `DELETE /admin/cache` | admin | Drop every cached answer, e.g. after a docs change |
+| `GET /v1/stream/{request_id}` | key | Resume a dropped stream from `Last-Event-ID` |
+| `GET /admin/usage/export` | admin | Usage rolled up per key or tenant, `?since=&until=&group_by=` |
+| `POST /admin/usage/push` | admin | Push a window's usage to the configured meter, once |
 | `POST /admin/drill` | admin | Fire one request, optionally with a fault |
 
 Errors keep the OpenAI envelope (`{"error": {"message", "type", "code"}}`) so
@@ -579,10 +617,10 @@ Generated by `uv run python -m bench.harness` on CPython 3.11.0, Windows AMD64. 
 | Requests | 600 |
 | Concurrency | 32 |
 | Successful | 600 / 600 |
-| Throughput | 263 req/s |
-| Latency p50 | 67.1 ms |
-| Latency p95 | 180.1 ms |
-| Latency p99 | 1061.2 ms |
+| Throughput | 167 req/s |
+| Latency p50 | 88.7 ms |
+| Latency p95 | 295.6 ms |
+| Latency p99 | 1159.1 ms |
 | Transport | in-process ASGI |
 
 Full gateway path per request: auth, model check, both rate-limit buckets, budget admission, provider call, ledger write. The provider is local and the transport is in-process, so this isolates the gateway's own overhead from both the model's speed and the socket. Add your network and your model on top.
@@ -596,10 +634,10 @@ Full gateway path per request: auth, model check, both rate-limit buckets, budge
 | Streams | 120 |
 | Transport | real uvicorn server over TCP |
 | Simulated per-chunk delay | 4 ms |
-| TTFT p50 | 6.6 ms |
+| TTFT p50 | 8.7 ms |
 | TTFT p95 | 11.1 ms |
-| Full response p50 | 15.8 ms |
-| First word arrives after | 41.9% of the total wait |
+| Full response p50 | 22.7 ms |
+| First word arrives after | 38.4% of the total wait |
 
 Measured from request start to the first frame carrying content, which is the number a user perceives as the model's speed. The gateway pays its overhead once, at the front, and then gets out of the way of the stream.
 
@@ -611,10 +649,10 @@ Measured from request start to the first frame carrying content, which is the nu
 |---|---|
 | Requests | 400 |
 | Fault rate requested | 25% |
-| Observed 503s | 388 (97.0%) |
-| Succeeded anyway | 12 |
-| Marked retryable | 388 / 388 |
-| Ledger rows tagged as a drill | 388 |
+| Observed 503s | 397 (99.2%) |
+| Succeeded anyway | 3 |
+| Marked retryable | 397 / 397 |
+| Ledger rows tagged as a drill | 397 |
 
 Every failure is tagged in the ledger with the fault that caused it, so a rehearsal is never mistaken for a real outage when the history is read back. The retryable flag is what the routing layer acts on.
 
@@ -708,6 +746,21 @@ The cache pays for itself on the first repeat. Here every question after the fir
 - PASS: every repeat was a hit
 - PASS: only the distinct questions reached a provider
 
+### A dropped stream, resumed
+
+| Measure | Value |
+|---|---|
+| Frames seen before the drop | 3 |
+| Last id seen | 2 |
+| Frames replayed on resume | 25 |
+| Stream closed cleanly after resume | True |
+
+The client drops after three frames and reconnects saying which id it last saw. It gets the frames after that id and nothing before, so the answer reassembles with no repeat and no hole. The buffer is in memory and per process, so this works against the instance that served the stream; behind several replicas the client reconnects to that one.
+
+- PASS: resume replays only frames after the last one seen
+- PASS: the replayed frames are contiguous, no gap
+- PASS: the resumed stream reaches its end marker
+
 ### Where the budget ceiling does not hold
 
 One honest limit, worth stating because a guarantee with unstated conditions is a lie with good manners. Admission prices the prompt with a local heuristic of about four characters per token, and that heuristic undershoots on code, CJK text and base64, so a real provider can bill more input than was estimated. The overshoot is bounded by that estimation error on a single request.
@@ -733,15 +786,14 @@ docker compose up -d --build
 
 ## Build log
 
-Built in the open, a week at a time. Weeks 1 to 3 are what the code does today.
-The rest is intent, not a promise with a date on it.
+Built in the open, a week at a time. Weeks 1 to 4 are what the code does today.
 
 | Week | Status | What landed |
 |---|---|---|
 | 1 | **done** | Providers, streaming, virtual keys, budgets with atomic reservations, rate limits, fault injection, the ledger, the dashboard |
 | 2 | **done** | Routes and fallback chains, retries with jittered backoff, circuit breakers per target, complexity-based tier routing, provider health |
 | 3 | **done** | Semantic cache (SQLite default, Pinecone/OpenAI-embeddings opt-in), PII redaction and prompt-injection filtering as chainable pre/post hooks |
-| 4 | planned | OpenTelemetry tracing, usage-based billing export, SSE resume across a mid-stream failure |
+| 4 | **done** | OpenTelemetry tracing, usage metering per key and tenant with a Stripe export, resuming a dropped stream from its last event id |
 
 ---
 
@@ -758,8 +810,10 @@ because you should not find out from a 500.
 | Name and address redaction | PII redaction is regex: it catches the shapes of emails, cards, phones, SSNs, IPs and keys, not a person's name or a written-out address. That needs a model and is deliberately not bundled |
 | Injection *prevention* | Injection detection is a heuristic tripwire for the obvious attempts, not a boundary. A novel or obfuscated attack passes it, and an innocent prompt about injection can trip it. The real defence is not trusting model output with authority |
 | Cache stampede de-duplication | Many identical requests that miss at the same instant each call the provider and each store an entry, before the first has finished. The answers are correct and the duplicates are harmless, but the first burst is not de-duplicated |
-| Tracing | Per-request cost and latency are in the ledger, but there are no OpenTelemetry spans to join up with the rest of your system |
-| Mid-stream resume | A stream that dies after the first token stays dead. Failover only works before the first token, and the event ids needed to do better are in place but nothing reads them yet |
+| Content in traces | Spans carry metadata, not the prompt or completion, unless you opt in. That opt-in is a real footgun on a busy trace pipeline, so it is off and stays off unless you set it knowing where your traces go |
+| Live re-attach to an in-flight stream | Resume replays the frames buffered so far and closes. If the original stream is still being produced, the client gets what exists and reconnects for the rest; it is not a persistent live tail |
+| Resume, and metering idempotency, across restarts or replicas | The stream buffer is in memory, so a restart loses it and there is nothing to resume, which is correct but abrupt. Metering's once-only guarantee is per database; behind several gateways, point them at one database or one meter with its own dedup |
+| Automatic tenant billing | Metering rolls usage up per tenant and can push it to Stripe meters, but mapping a tenant to a Stripe customer and a metric to a meter is configuration you provide; usage with no tenant is exported but never billed to a guessed account |
 | Shared breakers, shared cache | Circuit state and the SQLite cache are per process. Several replicas each learn from their own traffic; the Pinecone backend shares the cache across replicas, the SQLite one does not |
 
 ---
@@ -774,8 +828,8 @@ matrix that would have tested one Python version four times, a circuit breaker
 that could never recover because ``0.0`` is falsy, a feature flag that only
 half turned its feature off, an allow-list that a route could fail over straight
 past, a cache that billed its own hits, an expiry clock that meant nothing after
-a restart, and a lexical embedder whose false hits the bench found before a user
-could.
+a restart, a lexical embedder whose false hits the bench found before a user
+could, and a usage push that a check-then-act race could have sent twice.
 
 None of them were found by the suite going red. All of them were found by
 looking on purpose.

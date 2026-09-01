@@ -628,6 +628,68 @@ class Bench:
         return result
 
 
+    async def resume(self, workdir: Path) -> Result:
+        """A stream is dropped part way, then resumed from the last id the client
+        saw. The proof is that the reassembled answer has no gap and no repeat.
+        """
+        app = create_app(Settings(
+            db_path=workdir / "resume.db", admin_token="bench", resume_enabled=True,
+            _env_file=None,
+        ))
+        _key, secret = await app.state.store.create_key(name="resume")
+        headers = {"Authorization": f"Bearer {secret}"}
+
+        async with AsyncClient(transport=ASGITransport(app=app),
+                               base_url="http://bench.local", timeout=60.0) as client:
+            # First connection: read only part of the stream, then "drop" by
+            # stopping early, keeping the last id seen.
+            seen_before = 0
+            last_id = -1
+            request_id = ""
+            async with client.stream("POST", "/v1/chat/completions",
+                                     json=body(max_tokens=64, stream=True),
+                                     headers=headers) as r:
+                request_id = r.headers["X-Stormdoor-Request-Id"]
+                async for line in r.aiter_lines():
+                    if line.startswith("id: "):
+                        last_id = int(line[4:])
+                        seen_before += 1
+                        if seen_before == 3:  # pretend the connection dies here
+                            break
+
+            # Reconnect and resume from the last id seen.
+            resumed_ids: list[int] = []
+            got_done = False
+            rr = await client.get(f"/v1/stream/{request_id}",
+                                  headers={**headers, "Last-Event-ID": str(last_id)})
+            for line in (await rr.aread()).decode().splitlines():
+                if line.startswith("id: "):
+                    resumed_ids.append(int(line[4:]))
+                elif line.strip() == "data: [DONE]":
+                    got_done = True
+
+        no_repeat = all(i > last_id for i in resumed_ids)
+        contiguous = resumed_ids == list(range(last_id + 1, last_id + 1 + len(resumed_ids)))
+        app.state.store.close()
+
+        result = Result("A dropped stream, resumed")
+        result.add("Frames seen before the drop", seen_before)
+        result.add("Last id seen", last_id)
+        result.add("Frames replayed on resume", len(resumed_ids))
+        result.add("Stream closed cleanly after resume", got_done)
+        result.check("resume replays only frames after the last one seen", no_repeat)
+        result.check("the replayed frames are contiguous, no gap", contiguous)
+        result.check("the resumed stream reaches its end marker", got_done)
+        result.note = (
+            "The client drops after three frames and reconnects saying which id it "
+            "last saw. It gets the frames after that id and nothing before, so the "
+            "answer reassembles with no repeat and no hole. The buffer is in memory "
+            "and per process, so this works against the instance that served the "
+            "stream; behind several replicas the client reconnects to that one."
+        )
+        return result
+
+
 def render(results: list[Result]) -> str:
     lines: list[str] = []
     lines.append(
@@ -699,6 +761,7 @@ async def main() -> int:
                 await bench.limits(),
                 await bench.failover(Path(tmp)),
                 await bench.cache(Path(tmp)),
+                await bench.resume(Path(tmp)),
             ]
 
     section = render(results)

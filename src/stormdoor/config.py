@@ -153,6 +153,36 @@ class Settings(BaseSettings):
     # How many distinct injection signals must fire before a flag or a block.
     guardrail_injection_threshold: int = 1
 
+    # ── tracing ───────────────────────────────────────────────────────────
+    # Off by default, and off means the OpenTelemetry SDK is never imported. On,
+    # every request emits one span with model, tokens, cost, latency and the
+    # failover trail, exported to the OTLP endpoint (or the console if none set).
+    otel_enabled: bool = False
+    otel_service_name: str = "stormdoor"
+    otel_exporter_endpoint: str | None = None
+    otel_console: bool = False
+    # Prompt and completion text are kept OUT of spans by default, because a span
+    # usually leaves the process. Turn this on only knowing that.
+    otel_include_content: bool = False
+
+    # ── streaming resume ──────────────────────────────────────────────────
+    # Buffers each stream's frames in memory so a dropped connection can resume
+    # from its last event id via GET /v1/stream/{request_id}. Bounded and
+    # per-process; not shared across replicas.
+    resume_enabled: bool = False
+    resume_max_streams: int = 256
+    resume_max_frames: int = 512
+    resume_ttl_s: float = 300.0
+
+    # ── metering / Stripe ─────────────────────────────────────────────────
+    # Usage export (GET /admin/usage/export) needs none of these. They are only
+    # for pushing usage to Stripe billing meters, which is opt-in and needs the
+    # stripe extra. The two maps are JSON: tenant -> Stripe customer id, and
+    # metric -> Stripe meter event_name.
+    stripe_api_key: str | None = None
+    stripe_customer_map: str | None = None
+    stripe_meter_map: str | None = None
+
     @property
     def db_url(self) -> str:
         return str(self.db_path)

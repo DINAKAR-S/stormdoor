@@ -119,6 +119,13 @@ class RequestContext:
     started_at: float = field(default_factory=time.perf_counter)
     first_token_at: float | None = None
     chaos_fault: str | None = None
+    # Filled in along the way for the one trace span emitted per request. Kept on
+    # the context so the single ledger-write choke point can emit the span without
+    # every caller threading these values through their own signatures.
+    requested_model: str | None = None
+    cache_hit: bool | None = None
+    prompt_preview: str | None = None
+    completion_preview: str | None = None
 
     def mark_first_token(self) -> None:
         if self.first_token_at is None:

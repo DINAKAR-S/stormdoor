@@ -36,10 +36,13 @@ from .errors import AuthError, BadRequest, StormdoorError, UnknownModel
 from .gateway import Gateway
 from .hooks import build_hook_chain
 from .limits import build_limiter
+from .metering import build_meter_sink, push_usage
 from .pricing import PriceBook
 from .providers import build_registry
+from .resume import StreamBuffer
 from .routing import TIER_HEADER, RouteTable
 from .store import Store, VirtualKey
+from .tracing import build_tracer
 from .types import ChatCompletionRequest, RequestContext
 from .vectorstore import build_vector_store
 
@@ -51,6 +54,9 @@ DASHBOARD_HTML = Path(__file__).parent / "static" / "dashboard.html"
 # A day filter reaches a SQL comparison, so it is validated in shape before it
 # gets there rather than trusted because the dashboard happened to send it.
 _DAY = re.compile(r"\d{4}-\d{2}-\d{2}")
+# An ISO date, optionally with a time, since usage windows are compared against
+# the ledger's own ISO timestamps. Validated in shape before it reaches a query.
+_TS = re.compile(r"^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2})?([+-]\d{2}:\d{2}|Z)?)?$")
 
 
 # ── admin request bodies ─────────────────────────────────────────────────────
@@ -63,6 +69,7 @@ class CreateKeyBody(BaseModel):
     tpm: int | None = Field(default=None, ge=1)
     allowed_models: list[str] = Field(default_factory=list)
     expires_at: str | None = None
+    tenant: str | None = Field(default=None, max_length=120)
 
     @field_validator("name")
     @classmethod
@@ -170,6 +177,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ttl_s=settings.cache_ttl_s,
             enabled=True,
         )
+    tracer = build_tracer(settings)
+    meter_sink = build_meter_sink(settings)
+    stream_buffer = None
+    if settings.resume_enabled:
+        stream_buffer = StreamBuffer(
+            max_streams=settings.resume_max_streams,
+            max_frames=settings.resume_max_frames,
+            ttl_s=settings.resume_ttl_s,
+        )
 
     app.state.settings = settings
     app.state.store = store
@@ -179,9 +195,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.breaker = breaker
     app.state.cache = cache
     app.state.hooks = hooks
+    app.state.tracer = tracer
+    app.state.meter_sink = meter_sink
+    app.state.stream_buffer = stream_buffer
     app.state.gateway = Gateway(
         settings=settings, store=store, limiter=limiter, registry=registry,
         prices=prices, routes=routes, breaker=breaker, cache=cache, hooks=hooks,
+        tracer=tracer, stream_buffer=stream_buffer,
     )
 
     if routes.names():
@@ -195,6 +215,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
     if hooks.active:
         log.info("guardrail hooks active: %s", settings.guardrail_hooks)
+
+    if settings.otel_enabled:
+        log.info("tracing ENABLED: exporting spans to %s%s",
+                 settings.otel_exporter_endpoint or "the console",
+                 " (with prompt/completion content)" if settings.otel_include_content else "")
+    if stream_buffer is not None:
+        log.info("stream resume ENABLED: buffering up to %d streams for %.0fs",
+                 settings.resume_max_streams, settings.resume_ttl_s)
+    if meter_sink is not None:
+        log.info("metering sink configured: %s", meter_sink.name)
 
     if settings.chaos_enabled:
         log.warning(
@@ -254,7 +284,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         key: VirtualKey = Depends(_require_key),
         gateway: Gateway = Depends(_gateway),
     ):
-        ctx = RequestContext()
+        ctx = RequestContext(requested_model=body.model)
         chaos = ChaosGate(
             parse_spec(request.headers.get(CHAOS_HEADER) or settings.chaos_default),
             enabled=settings.chaos_enabled,
@@ -298,6 +328,53 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         payload = await gateway.complete(key, admission.request, admission, chaos, ctx)
         return JSONResponse(payload, headers={"X-Stormdoor-Request-Id": ctx.request_id})
 
+    @app.get("/v1/stream/{request_id}")
+    async def resume_stream(
+        request_id: str,
+        request: Request,
+        last_event_id: int | None = None,
+        key: VirtualKey = Depends(_require_key),
+    ):
+        """Resume a dropped stream from the last event id the client saw.
+
+        The request id comes back in the `X-Stormdoor-Request-Id` header of the
+        original stream. Reconnect here with a `Last-Event-ID` header (or a
+        `?last_event_id=` query) and get the frames after it. A stream this key
+        did not create, or one that has expired, is a 404, and the two are
+        indistinguishable on purpose so one key cannot probe another's ids.
+        """
+        buffer = request.app.state.stream_buffer
+        if buffer is None:
+            raise BadRequest("stream resume is not enabled on this gateway",
+                             code="resume_disabled")
+        header_id = request.headers.get("Last-Event-ID")
+        after = last_event_id if last_event_id is not None else (
+            int(header_id) if header_id and header_id.lstrip("-").isdigit() else -1
+        )
+        replay = buffer.replay(request_id, after_id=after, key_id=key.id)
+        if replay is None:
+            raise UnknownModel(  # reuse the 404 envelope
+                f"no resumable stream {request_id!r} for this key", param="request_id")
+        if replay.too_far_behind:
+            raise BadRequest(
+                "the buffer no longer holds frames from that point; restart the request",
+                code="resume_too_far_behind")
+
+        async def replayed():
+            for frame in replay.frames:
+                yield frame
+            if not replay.frames and not replay.done:
+                # Nothing new yet and the stream is still live: send a comment so
+                # the connection is not mistaken for a dead one, then close. The
+                # client reconnects for more.
+                yield ": no new frames yet\n\n"
+
+        return StreamingResponse(
+            replayed(), media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+                     "X-Stormdoor-Request-Id": request_id},
+        )
+
     # ── admin plane ──────────────────────────────────────────────────────
 
     @app.post("/admin/keys", dependencies=[Depends(_require_admin)], status_code=201)
@@ -309,6 +386,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             tpm=body.tpm,
             allowed_models=body.allowed_models,
             expires_at=body.expires_at,
+            tenant=body.tenant,
         )
         # The only time the plaintext exists outside the caller's hands.
         return {"key": key.public(), "secret": secret}
@@ -400,6 +478,41 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         n = await asyncio.to_thread(cache.invalidate)
         return {"invalidated": n}
 
+    @app.get("/admin/usage/export", dependencies=[Depends(_require_admin)])
+    async def usage_export(since: str | None = None, until: str | None = None,
+                           group_by: str = "key") -> dict:
+        """Usage rolled up for billing, over a window, grouped by key or tenant.
+
+        Needs no external service: this is the ledger aggregated, which is what a
+        billing job wants to read. `since` and `until` are ISO timestamps compared
+        against the ledger's own; omit them for all time.
+        """
+        if group_by not in ("key", "tenant"):
+            raise BadRequest("group_by must be 'key' or 'tenant'", param="group_by")
+        for label, value in (("since", since), ("until", until)):
+            if value is not None and not _TS.match(value):
+                raise BadRequest(f"{label} must be an ISO timestamp", param=label)
+        rows = await store.usage_export(since=since, until=until, group_by=group_by)
+        return {"group_by": group_by, "since": since, "until": until, "rows": rows}
+
+    @app.post("/admin/usage/push", dependencies=[Depends(_require_admin)])
+    async def usage_push(since: str | None = None, until: str | None = None) -> dict:
+        """Push the window's usage to the configured meter, exactly once.
+
+        Idempotent: a window already pushed is refused rather than billed twice.
+        Returns 400 if no meter is configured, because a push with nowhere to go
+        is a mistake worth surfacing, not a silent no-op.
+        """
+        if meter_sink is None:
+            raise BadRequest(
+                "no metering sink configured; set STORMDOOR_STRIPE_API_KEY to push, "
+                "or use GET /admin/usage/export to read usage without a sink",
+                code="no_meter_sink")
+        for label, value in (("since", since), ("until", until)):
+            if value is not None and not _TS.match(value):
+                raise BadRequest(f"{label} must be an ISO timestamp", param=label)
+        return await push_usage(store, meter_sink, since=since, until=until)
+
     @app.get("/admin/health", dependencies=[Depends(_require_admin)])
     async def routing_health() -> dict:
         """Circuit state per target, and the routes behind it.
@@ -437,7 +550,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             stream=body.stream,
             max_tokens=body.max_tokens,
         )
-        ctx = RequestContext()
+        ctx = RequestContext(requested_model=body.model)
         chaos = ChaosGate(parse_spec(body.chaos), enabled=settings.chaos_enabled)
 
         cached = None

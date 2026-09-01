@@ -32,7 +32,19 @@ redis = ["redis>=5.2"]
 # these. Pinecone is the opt-in vector backend for scale; real embeddings reuse
 # the openai extra.
 pinecone = ["pinecone>=5.0"]
-all = ["anthropic>=0.40", "openai>=1.55", "redis>=5.2", "pinecone>=5.0"]
+# Tracing needs the OTel SDK and the OTLP HTTP exporter; Stripe metering needs
+# the Stripe SDK. Both features are off unless configured, so neither is a
+# default dependency.
+otel = [
+  "opentelemetry-sdk>=1.27",
+  "opentelemetry-exporter-otlp-proto-http>=1.27",
+]
+stripe = ["stripe>=10.0"]
+all = [
+  "anthropic>=0.40", "openai>=1.55", "redis>=5.2", "pinecone>=5.0",
+  "opentelemetry-sdk>=1.27", "opentelemetry-exporter-otlp-proto-http>=1.27",
+  "stripe>=10.0",
+]
 dev = [
   "pytest>=8.3",
   "pytest-asyncio>=0.24",

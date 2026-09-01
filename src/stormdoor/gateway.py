@@ -46,9 +46,11 @@ from .hooks import HookChain, HookNotes
 from .limits import Limiter
 from .pricing import PriceBook
 from .providers import Provider, ProviderRegistry
+from .resume import StreamBuffer
 from .routing import Complexity, RouteTable, score
 from .store import Store, VirtualKey
 from .tokens import estimate_prompt_tokens
+from .tracing import NoopTracer, Tracer, request_attributes
 from .types import (
     ChatCompletionRequest,
     Completion,
@@ -121,6 +123,8 @@ class Gateway:
         breaker: CircuitBreaker | None = None,
         cache: SemanticCache | None = None,
         hooks: HookChain | None = None,
+        tracer: Tracer | None = None,
+        stream_buffer: StreamBuffer | None = None,
     ):
         self.settings = settings
         self.store = store
@@ -131,6 +135,8 @@ class Gateway:
         self.breaker = breaker or CircuitBreaker()
         self.cache = cache
         self.hooks = hooks or HookChain()
+        self.tracer = tracer or NoopTracer()
+        self.stream_buffer = stream_buffer
 
     # ── 1. authenticate ──────────────────────────────────────────────────
 
@@ -327,7 +333,50 @@ class Gateway:
                 "no verified rate for model %r: request %s recorded at $0.00 and flagged",
                 model, ctx.request_id,
             )
+        self._trace(ctx, requested_model=ctx.requested_model or model, served_model=model,
+                    provider=provider, usage=usage, cost=cost, status=status,
+                    attempts=trail.tried, failed_over_from=trail.failed_over_from,
+                    error=error_code if status in ("error", "aborted") else None)
         return cost
+
+    def _trace(self, ctx: RequestContext, *, requested_model: str, served_model: str,
+               provider: str, usage: TokenUsage, cost: float, status: str,
+               attempts: int, failed_over_from: str | None, error: str | None) -> None:
+        """Emit the one span for this request. A no-op tracer makes this free, so
+        the call is unconditional and the cost of tracing being off is nothing.
+
+        Timestamps are reconstructed from the request's own latency rather than
+        wrapping the whole path in a live span: the gateway already records every
+        terminal outcome here, in one place, and a retro span keeps instrumentation
+        to that one place instead of threading a span through routing and failover.
+        """
+        end_ns = time.time_ns()
+        attrs = request_attributes(
+            requested_model=requested_model, served_model=served_model, provider=provider,
+            input_tokens=usage.input_tokens, output_tokens=usage.output_tokens,
+            cost_usd=cost, status=status, cache_hit=ctx.cache_hit, attempts=attempts,
+            failed_over_from=failed_over_from, chaos_fault=ctx.chaos_fault,
+            prompt_preview=ctx.prompt_preview, completion_preview=ctx.completion_preview,
+        )
+        try:
+            self.tracer.record_request(
+                name="stormdoor.chat", start_unix_ns=end_ns - ctx.latency_ms * 1_000_000,
+                end_unix_ns=end_ns, attributes=attrs, error=error,
+            )
+        except Exception:  # noqa: BLE001
+            # Tracing is observability, not the request. A broken exporter must
+            # never turn a served answer into a failed one, so its failure is
+            # logged and swallowed rather than propagated.
+            log.warning("trace export failed for request %s", ctx.request_id, exc_info=True)
+
+    def _maybe_preview(self, ctx: RequestContext, req: ChatCompletionRequest,
+                       completion_text: str) -> None:
+        """Stash prompt and completion previews on the context, but only when the
+        operator has explicitly opted into content in traces. Off by default,
+        because a span usually leaves the process and the prompt should not."""
+        if getattr(self.settings, "otel_include_content", False):
+            ctx.prompt_preview = req.prompt_text()
+            ctx.completion_preview = completion_text
 
     async def record_refusal(
         self, key: VirtualKey, ctx: RequestContext, req: ChatCompletionRequest,
@@ -353,6 +402,9 @@ class Gateway:
             attempts=0,
             failed_over_from=None,
         )
+        self._trace(ctx, requested_model=req.model, served_model=req.model,
+                    provider="stormdoor", usage=TokenUsage(), cost=0.0, status="refused",
+                    attempts=0, failed_over_from=None, error=err.code)
 
     # ── 6 and 7. the call, with retries and failover ─────────────────────
 
@@ -455,6 +507,8 @@ class Gateway:
         if hit is None:
             return None
         ctx.mark_first_token()
+        ctx.cache_hit = True
+        self._maybe_preview(ctx, req, hit.completion.text)
         await self._record(
             key=key, ctx=ctx, model=hit.completion.model, provider="cache",
             usage=hit.completion.usage, status="cache_hit", streamed=False,
@@ -490,11 +544,13 @@ class Gateway:
             raise
 
         ctx.mark_first_token()
+        ctx.cache_hit = False
         # Output guardrails run on the answer before it is billed, cached or
         # returned, so a redacted response is what the caller sees and what the
         # cache stores. Storing the raw answer would leave PII sitting in the
         # cache to be served again later.
         result = replace(result, text=self.hooks.on_response(result.text, notes))
+        self._maybe_preview(ctx, req, result.text)
         cost = await self._record(
             key=key, ctx=ctx, model=result.model, provider=target.provider.name,
             usage=result.usage, status="ok", streamed=False,
@@ -635,6 +691,19 @@ class Gateway:
         text_seen = 0
         provider_name = admission.first.provider.name
 
+        # Every frame is copied into the resume buffer as it goes out, keyed by
+        # the request id the caller has in a response header, so a dropped
+        # connection can be picked up from the last id it saw. The buffer is
+        # opened only when resume is enabled and only for a stream.
+        buf = self.stream_buffer
+        if buf is not None:
+            buf.open(ctx.request_id, key.id)
+
+        def emit(s: str) -> str:
+            if buf is not None:
+                buf.append(ctx.request_id, s)
+            return s
+
         def frame(payload: dict, *, event: str | None = None) -> str:
             nonlocal index
             head = f"id: {index}\n"
@@ -650,7 +719,7 @@ class Gateway:
             provider_name = target.provider.name
             model_used = target.model
 
-            yield frame(_chunk(cid, created, model_used, delta={"role": "assistant"}))
+            yield emit(frame(_chunk(cid, created, model_used, delta={"role": "assistant"})))
 
             async def replayed():
                 # The first event was already pulled to decide failover, so it
@@ -666,14 +735,15 @@ class Gateway:
                     if chaos.should_abort_stream(text_seen):
                         raise chaos.abort_error()
                     piece = self.hooks.on_response(event.text, notes)
-                    yield frame(_chunk(cid, created, model_used, delta={"content": piece}))
+                    yield emit(frame(_chunk(cid, created, model_used, delta={"content": piece})))
                 elif isinstance(event, StreamDone):
                     usage = event.usage
                     model_used = event.model
                     finish_reason = event.finish_reason
 
-            yield frame(_chunk(cid, created, model_used, delta={}, finish_reason=finish_reason))
-            yield frame(
+            yield emit(frame(_chunk(cid, created, model_used, delta={},
+                                    finish_reason=finish_reason)))
+            yield emit(frame(
                 {
                     "id": cid,
                     "object": "chat.completion.chunk",
@@ -682,16 +752,18 @@ class Gateway:
                     "choices": [],
                     "usage": usage.as_openai(),
                 }
-            )
-            yield "data: [DONE]\n\n"
+            ))
+            yield emit("data: [DONE]\n\n")
 
         except ProviderError as err:
             status = "aborted" if text_seen else "error"
             error_code = err.code
-            yield frame(err.envelope(), event="error")
-            yield "data: [DONE]\n\n"
+            yield emit(frame(err.envelope(), event="error"))
+            yield emit("data: [DONE]\n\n")
 
         finally:
+            if buf is not None:
+                buf.mark_done(ctx.request_id)
             await self._record(
                 key=key, ctx=ctx, model=model_used, provider=provider_name,
                 usage=usage, status=status, streamed=True, error_code=error_code,

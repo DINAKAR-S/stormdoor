@@ -310,6 +310,47 @@ should measure the real case while the docs cover the adversarial one.
 
 ---
 
+## 18. The usage push had a race worth exactly one double-bill
+
+The push to an external meter first checked "has this window been pushed", then
+pushed, then recorded that it had. Read, act, write. Fire two pushes for the same
+window at once and both pass the check, both call the meter, and only then does
+one of them record. The customer is billed twice for the same usage.
+
+It was invisible in a sequential test, which is where this kind of bug always
+hides: the check and the record are only ever a problem when something runs
+between them, and a single-threaded test never does.
+
+The fix is the same shape as the budget fix a few weeks earlier: claim the period
+atomically before doing the expensive, side-effectful thing, so the claim is the
+lock and two callers cannot both win it. A push that then fails releases its claim
+so the window can be retried rather than being stuck as pushed-but-empty. A
+ship-gate probe fired two pushes concurrently and asserted the meter was called
+once.
+
+> Any "check, then do the irreversible thing, then record" is a double-spend
+> waiting for concurrency. Claim first, do second. The claim is the lock.
+
+---
+
+## 19. Observability must not be able to break the thing it observes
+
+Tracing emits a span at the end of every request. The exporter can fail: the
+collector is down, the endpoint is wrong, the network blips. The first version let
+that exception propagate, which meant turning tracing on added a brand new way for
+a request that was answered perfectly to come back a 500.
+
+That is exactly backwards. A trace is a note about what happened; it cannot be
+allowed to change what happened. The span emission is wrapped so a failing
+exporter is logged and swallowed, and a ship-gate probe with a tracer that always
+throws confirmed the request still returns 200.
+
+> Instrumentation sits outside the request's success. If a metric, a log or a span
+> can fail the request, the request now depends on your monitoring being up, which
+> is the opposite of what monitoring is for.
+
+---
+
 ## The rule underneath all of these
 
 The test suite proves the code does what you thought of. Something else has to
