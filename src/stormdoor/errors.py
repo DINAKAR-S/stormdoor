@@ -86,6 +86,31 @@ class BudgetExceeded(StormdoorError):
         return env
 
 
+class GuardrailBlocked(StormdoorError):
+    """A request a guardrail hook refused before it reached a provider.
+
+    A 400 rather than a 403: the key is allowed here, the content is not, which
+    is a property of this request and not of the caller's permissions. Carries
+    which guardrail fired so an operator tuning a heuristic can see what tripped.
+    """
+
+    status_code = 400
+    error_type = "invalid_request_error"
+    code = "guardrail_blocked"
+
+    def __init__(self, message: str, *, guardrail: str, signals: list[str] | None = None):
+        super().__init__(message, param="messages")
+        self.guardrail = guardrail
+        self.signals = signals or []
+
+    def envelope(self) -> dict[str, Any]:
+        env = super().envelope()
+        env["error"]["guardrail"] = self.guardrail
+        if self.signals:
+            env["error"]["signals"] = self.signals
+        return env
+
+
 class RateLimited(StormdoorError):
     status_code = 429
     error_type = "rate_limit_error"

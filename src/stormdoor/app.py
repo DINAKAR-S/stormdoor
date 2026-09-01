@@ -14,6 +14,7 @@ to learn to recover.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -26,17 +27,21 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Stre
 from pydantic import BaseModel, Field, field_validator
 
 from .breaker import BreakerConfig, CircuitBreaker
+from .cache import SemanticCache
 from .chaos import HEADER as CHAOS_HEADER
 from .chaos import ChaosGate, parse_spec
 from .config import Settings, get_settings
+from .embeddings import build_embedder
 from .errors import AuthError, BadRequest, StormdoorError, UnknownModel
 from .gateway import Gateway
+from .hooks import build_hook_chain
 from .limits import build_limiter
 from .pricing import PriceBook
 from .providers import build_registry
 from .routing import TIER_HEADER, RouteTable
 from .store import Store, VirtualKey
 from .types import ChatCompletionRequest, RequestContext
+from .vectorstore import build_vector_store
 
 log = logging.getLogger("stormdoor")
 
@@ -154,6 +159,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             cooldown_s=settings.breaker_cooldown_s,
         )
     )
+    hooks = build_hook_chain(settings)
+    cache = None
+    if settings.cache_enabled:
+        embedder = build_embedder(settings)
+        vector_store = build_vector_store(settings, store)
+        cache = SemanticCache(
+            embedder, vector_store, store,
+            similarity_floor=settings.cache_similarity_floor,
+            ttl_s=settings.cache_ttl_s,
+            enabled=True,
+        )
 
     app.state.settings = settings
     app.state.store = store
@@ -161,13 +177,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.prices = prices
     app.state.routes = routes
     app.state.breaker = breaker
+    app.state.cache = cache
+    app.state.hooks = hooks
     app.state.gateway = Gateway(
         settings=settings, store=store, limiter=limiter, registry=registry,
-        prices=prices, routes=routes, breaker=breaker,
+        prices=prices, routes=routes, breaker=breaker, cache=cache, hooks=hooks,
     )
 
     if routes.names():
         log.info("routes loaded: %s", routes.names())
+
+    if cache is not None:
+        log.info(
+            "semantic cache ENABLED: %s backend, %s embedder, floor %.2f, ttl %.0fs",
+            settings.cache_backend, cache._embedder.name,
+            settings.cache_similarity_floor, settings.cache_ttl_s,
+        )
+    if hooks.active:
+        log.info("guardrail hooks active: %s", settings.guardrail_hooks)
 
     if settings.chaos_enabled:
         log.warning(
@@ -237,6 +264,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             admission = await gateway.admit(
                 key, body, tier_hint=request.headers.get(TIER_HEADER)
             )
+            # Cache first, so a hit costs nothing: it is checked before the
+            # budget is reserved. Streams are never cached, so they fall straight
+            # through to the reservation. A hit returns a finished body here.
+            if not body.stream:
+                cached = await gateway.cache_lookup(key, admission, ctx)
+                if cached is not None:
+                    return JSONResponse(
+                        cached, headers={"X-Stormdoor-Request-Id": ctx.request_id}
+                    )
+            # A miss (or a stream) reserves the budget now, just before the call.
+            # A BudgetExceeded here is recorded as a refusal like any other.
+            await gateway.reserve_budget(key, admission)
         except StormdoorError as err:
             ctx.chaos_fault = chaos.label
             await gateway.record_refusal(key, ctx, body, err)
@@ -244,7 +283,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         if body.stream:
             return StreamingResponse(
-                gateway.stream(key, body, admission, chaos, ctx),
+                gateway.stream(key, admission.request, admission, chaos, ctx),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -256,7 +295,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 },
             )
 
-        payload = await gateway.complete(key, body, admission, chaos, ctx)
+        payload = await gateway.complete(key, admission.request, admission, chaos, ctx)
         return JSONResponse(payload, headers={"X-Stormdoor-Request-Id": ctx.request_id})
 
     # ── admin plane ──────────────────────────────────────────────────────
@@ -337,7 +376,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "models": registry.catalogue(),
             "limiter": settings.limiter_backend,
             "chaos_enabled": settings.chaos_enabled,
+            "cache": cache.stats() if cache is not None else {"enabled": False},
+            "guardrails": {
+                "hooks": [h.name for h in hooks.pre] + [h.name for h in hooks.post],
+            },
         }
+
+    @app.get("/admin/cache", dependencies=[Depends(_require_admin)])
+    async def cache_stats() -> dict:
+        """Cache hit ratio and configuration. Enabled is false when the cache
+        is off, which is the default, so this never 404s."""
+        if cache is None:
+            return {"enabled": False}
+        return cache.stats()
+
+    @app.delete("/admin/cache", dependencies=[Depends(_require_admin)])
+    async def cache_invalidate() -> dict:
+        """Drop every cached answer. The usual reason is a changed backing
+        document: the cached answer is now wrong and no similarity floor catches
+        that, because the prompt did not change, the world did."""
+        if cache is None:
+            return {"enabled": False, "invalidated": 0}
+        n = await asyncio.to_thread(cache.invalidate)
+        return {"invalidated": n}
 
     @app.get("/admin/health", dependencies=[Depends(_require_admin)])
     async def routing_health() -> dict:
@@ -379,8 +440,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ctx = RequestContext()
         chaos = ChaosGate(parse_spec(body.chaos), enabled=settings.chaos_enabled)
 
+        cached = None
         try:
             admission = await gateway.admit(key, req)
+            if not body.stream:
+                cached = await gateway.cache_lookup(key, admission, ctx)
+            if cached is None:
+                await gateway.reserve_budget(key, admission)
         except UnknownModel:
             # Not a drill outcome. A model this gateway cannot route is a
             # mistake in the request, so it gets a real error status rather
@@ -396,6 +462,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "http_status": err.status_code,
                 "cost_usd": 0.0,
                 "detail": err.envelope()["error"],
+                "request_id": ctx.request_id,
+            }
+
+        if cached is not None:
+            return {
+                "outcome": "answered from cache",
+                "http_status": 200,
+                "cost_usd": 0.0,
+                "latency_ms": cached["stormdoor"]["latency_ms"],
+                "content": cached["choices"][0]["message"]["content"],
+                "usage": cached["usage"],
+                "cache": cached["stormdoor"].get("cache"),
                 "request_id": ctx.request_id,
             }
 

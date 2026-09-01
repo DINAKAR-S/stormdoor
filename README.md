@@ -17,10 +17,12 @@ nobody tests, because provoking a real 503 or a real mid-stream disconnect is
 inconvenient. So stormdoor injects them for you, and every reliability claim in
 this README is produced by a harness in `bench/` that you can rerun.
 
-> **Status: week 2 of a public build, and honest about it.** What works and is tested: providers,
+> **Status: week 3 of a public build, and honest about it.** What works and is tested: providers,
 > streaming, virtual keys, budgets, rate limits, fault injection, the ledger, the
-> dashboard, and routing with retries, circuit breaking and failover. Caching,
-> guardrails and tracing are not there. See the [build log](#build-log) and
+> dashboard, routing with retries, circuit breaking and failover, a semantic cache,
+> and guardrail hooks for PII redaction and prompt-injection filtering. Tracing and
+> mid-stream resume are not there, and the honest limits on the cache and the
+> guardrails are stated plainly. See the [build log](#build-log) and
 > [what is not built yet](#what-is-not-built-yet).
 
 ![The stormdoor dashboard: gateway counters and spend by day, with the most expensive day called out](docs/screenshots/dashboard.png)
@@ -68,10 +70,14 @@ else is the same, because stormdoor speaks the OpenAI API.
 | Someone asks what the chatbot costs | Export the invoice and estimate | One ledger query, per key, per model |
 | A contractor needs access for two weeks | Hand over the real key and hope | Mint a key with $5 and 10 rpm, disable it when they leave |
 | You want a model you have not used before | Another SDK, another key, another code path | Same endpoint, change the model string |
+| The same question is asked a thousand times a day | You pay for a thousand identical answers | Near-repeats are served from a semantic cache, billed at nothing |
+| A user pastes a credit-card number into a prompt | It goes to the provider, and into their logs | A redaction hook strips it before the request leaves |
 | The provider has a bad hour | Find out from your users | Rehearse it first, on purpose, and know what your app does |
 
-That last row is the one this project is actually about. Everything above it,
-other gateways do too.
+That last row is the one this project is actually about. Failover and fault
+injection are the parts other gateways do not ship; caching and redaction, some
+do, and the honest note on each is below in [what it does today](#what-it-does-today)
+and [what is not built yet](#what-is-not-built-yet).
 
 ---
 
@@ -251,6 +257,28 @@ clients.
 list of targets. Retryable failures are retried with jittered backoff then handed
 down the chain; a target that fails three times in a row is skipped until a probe
 says it recovered. See [When a provider goes down](#when-a-provider-goes-down).
+
+**A semantic cache, off by default.** When it is on, a non-streaming request
+whose prompt is close enough to a recent one is answered from cache and never
+reaches a provider, so it returns fast and costs nothing. "Close enough" is a
+cosine similarity above a floor that defaults high, because a low floor trades
+correctness for hit rate. The default backend is SQLite with a local, offline,
+key-free embedder that matches wording rather than meaning; a real embedding
+model (`openai`) and a hosted vector store (`pinecone`) are opt-in behind one
+interface for meaning-level matching at scale. A hit is scoped to the key, so one
+tenant is never served another's answer, and it is recorded in the ledger at
+`$0.00` so the hit ratio and the saving are visible. It only caches deterministic
+requests (temperature 0 or unset); a request that asked for variety gets it.
+
+**Guardrails, as a chain of hooks you compose.** An ordered, named chain runs on
+the way in and the way out, empty by default. `pii_redact` strips the shapes of
+emails, phone numbers, Luhn-valid cards, SSNs, IPs and key-like tokens out of a
+prompt before it leaves; `pii_redact_output` does the same to the answer;
+`injection_flag` and `injection_block` annotate or refuse the obvious
+prompt-injection shapes. What a guardrail did is surfaced on the response, so a
+redaction is auditable rather than a silent change. The honest limits on both are
+in [what is not built yet](#what-is-not-built-yet), because a guardrail that
+oversells itself is worse than none.
 
 **A dashboard, in one file.** Served at `/`, no build step, no framework, no web
 font, and no external request of any kind, which a test enforces. Gateway-wide
@@ -464,6 +492,17 @@ Everything takes a `STORMDOOR_` prefix, and `.env` is read if present.
 | `STORMDOOR_BREAKER_COOLDOWN_S` | `30` | How long a circuit stays open before one probe |
 | `STORMDOOR_ANTHROPIC_API_KEY` | unset | Falls back to the SDK's own resolution |
 | `STORMDOOR_OPENAI_API_KEY` / `..._BASE_URL` | unset | Also serves OpenAI-compatible servers |
+| `STORMDOOR_CACHE_ENABLED` | `false` | Turns on the semantic cache |
+| `STORMDOOR_CACHE_SIMILARITY_FLOOR` | `0.95` | How close two prompts must be to count as one question |
+| `STORMDOOR_CACHE_TTL_S` | `3600` | How long a cached answer stays valid |
+| `STORMDOOR_CACHE_BACKEND` | `sqlite` | `sqlite` (offline, default) or `pinecone` (needs the `pinecone` extra) |
+| `STORMDOOR_CACHE_EMBEDDER` | `local` | `local` (offline, matches wording) or `openai` (matches meaning, needs the `openai` extra and a key) |
+| `STORMDOOR_CACHE_EMBEDDING_DIM` | `1024` | Vector width for the local embedder; wider means fewer false hits |
+| `STORMDOOR_CACHE_MAX_CANDIDATES` | `200` | SQLite backend compares at most this many recent entries per scope |
+| `STORMDOOR_PINECONE_API_KEY` / `..._INDEX` | unset | Required for the pinecone backend |
+| `STORMDOOR_GUARDRAIL_HOOKS` | unset | Ordered chain, e.g. `pii_redact,injection_flag,pii_redact_output` |
+| `STORMDOOR_GUARDRAIL_PII_KINDS` | all | Subset of `email,phone,card,ssn,ip,key` |
+| `STORMDOOR_GUARDRAIL_INJECTION_THRESHOLD` | `1` | Distinct injection signals before a flag or block |
 
 ### A note on `default_max_tokens`
 
@@ -492,6 +531,8 @@ more room say so in the request.
 | `GET /admin/spend` | admin | Daily spend and the peak day, `?days=` and `?day=` |
 | `GET /admin/health` | admin | Circuit state per target, and the routes behind it |
 | `POST /admin/breaker/reset` | admin | Force a target back to closed |
+| `GET /admin/cache` | admin | Cache hit ratio and configuration |
+| `DELETE /admin/cache` | admin | Drop every cached answer, e.g. after a docs change |
 | `POST /admin/drill` | admin | Fire one request, optionally with a fault |
 
 Errors keep the OpenAI envelope (`{"error": {"message", "type", "code"}}`) so
@@ -538,10 +579,10 @@ Generated by `uv run python -m bench.harness` on CPython 3.11.0, Windows AMD64. 
 | Requests | 600 |
 | Concurrency | 32 |
 | Successful | 600 / 600 |
-| Throughput | 65 req/s |
-| Latency p50 | 409.7 ms |
-| Latency p95 | 655.8 ms |
-| Latency p99 | 869.4 ms |
+| Throughput | 263 req/s |
+| Latency p50 | 67.1 ms |
+| Latency p95 | 180.1 ms |
+| Latency p99 | 1061.2 ms |
 | Transport | in-process ASGI |
 
 Full gateway path per request: auth, model check, both rate-limit buckets, budget admission, provider call, ledger write. The provider is local and the transport is in-process, so this isolates the gateway's own overhead from both the model's speed and the socket. Add your network and your model on top.
@@ -555,10 +596,10 @@ Full gateway path per request: auth, model check, both rate-limit buckets, budge
 | Streams | 120 |
 | Transport | real uvicorn server over TCP |
 | Simulated per-chunk delay | 4 ms |
-| TTFT p50 | 26.8 ms |
-| TTFT p95 | 35.5 ms |
-| Full response p50 | 68.8 ms |
-| First word arrives after | 39.0% of the total wait |
+| TTFT p50 | 6.6 ms |
+| TTFT p95 | 11.1 ms |
+| Full response p50 | 15.8 ms |
+| First word arrives after | 41.9% of the total wait |
 
 Measured from request start to the first frame carrying content, which is the number a user perceives as the model's speed. The gateway pays its overhead once, at the front, and then gets out of the way of the stream.
 
@@ -570,10 +611,10 @@ Measured from request start to the first frame carrying content, which is the nu
 |---|---|
 | Requests | 400 |
 | Fault rate requested | 25% |
-| Observed 503s | 389 (97.2%) |
-| Succeeded anyway | 11 |
-| Marked retryable | 389 / 389 |
-| Ledger rows tagged as a drill | 389 |
+| Observed 503s | 388 (97.0%) |
+| Succeeded anyway | 12 |
+| Marked retryable | 388 / 388 |
+| Ledger rows tagged as a drill | 388 |
 
 Every failure is tagged in the ledger with the fault that caused it, so a rehearsal is never mistaken for a real outage when the history is read back. The retryable flag is what the routing layer acts on.
 
@@ -651,6 +692,22 @@ Same injected outage both times, so the difference is the feature and not the we
 - PASS: the outage reaches the caller when failover is off
 - PASS: the caller never sees the outage when failover is on
 
+### What the semantic cache saves
+
+| Measure | Value |
+|---|---|
+| Requests | 200 |
+| Distinct questions | 20 |
+| Repeats (could hit) | 180 |
+| Hits | 180 |
+| Hit ratio | 90.0% |
+| Spent (only the misses) | $0.9310 |
+
+The cache pays for itself on the first repeat. Here every question after the first of its kind is served without a provider call and billed at nothing, so 180 of 200 requests cost zero. The embedder in this drill is the local lexical one, which needs no key; a real embedding model would also collapse paraphrases the lexical one misses, at the cost of an embedding call per lookup. A too-low similarity floor would trade this hit rate for the risk of serving a subtly different answer, which is why the floor defaults high.
+
+- PASS: every repeat was a hit
+- PASS: only the distinct questions reached a provider
+
 ### Where the budget ceiling does not hold
 
 One honest limit, worth stating because a guarantee with unstated conditions is a lie with good manners. Admission prices the prompt with a local heuristic of about four characters per token, and that heuristic undershoots on code, CJK text and base64, so a real provider can bill more input than was estimated. The overshoot is bounded by that estimation error on a single request.
@@ -676,14 +733,14 @@ docker compose up -d --build
 
 ## Build log
 
-Built in the open, a week at a time. Weeks 1 and 2 are what the code does today.
+Built in the open, a week at a time. Weeks 1 to 3 are what the code does today.
 The rest is intent, not a promise with a date on it.
 
 | Week | Status | What landed |
 |---|---|---|
 | 1 | **done** | Providers, streaming, virtual keys, budgets with atomic reservations, rate limits, fault injection, the ledger, the dashboard |
 | 2 | **done** | Routes and fallback chains, retries with jittered backoff, circuit breakers per target, complexity-based tier routing, provider health |
-| 3 | next | Semantic cache, PII redaction and prompt-injection filtering as request hooks |
+| 3 | **done** | Semantic cache (SQLite default, Pinecone/OpenAI-embeddings opt-in), PII redaction and prompt-injection filtering as chainable pre/post hooks |
 | 4 | planned | OpenTelemetry tracing, usage-based billing export, SSE resume across a mid-stream failure |
 
 ---
@@ -695,11 +752,15 @@ because you should not find out from a 500.
 
 | Not there | What that means for you today |
 |---|---|
-| Semantic caching | Two identical questions cost twice |
-| Guardrails | No PII redaction and no prompt-injection filtering on the request path |
+| Meaning-level caching by default | The default cache embedder matches wording, not meaning, so "cancel my order" and "I want to stop my purchase" are two different questions to it. Set `cache_embedder=openai` for meaning; it needs a key and a call per lookup |
+| A cache that cannot be fooled | The local embedder hashes words into a fixed-width vector, so two different prompts can, rarely, collide into a false hit and serve the wrong answer. The default width keeps this rare; a real embedding model does not have this failure. The similarity floor bounds the risk, it does not remove it |
+| Output redaction on a stream, without gaps | Streaming output is redacted chunk by chunk, so a PII token split across two chunks can slip through. Non-streaming responses are redacted whole. The semantic cache does not apply to streams at all |
+| Name and address redaction | PII redaction is regex: it catches the shapes of emails, cards, phones, SSNs, IPs and keys, not a person's name or a written-out address. That needs a model and is deliberately not bundled |
+| Injection *prevention* | Injection detection is a heuristic tripwire for the obvious attempts, not a boundary. A novel or obfuscated attack passes it, and an innocent prompt about injection can trip it. The real defence is not trusting model output with authority |
+| Cache stampede de-duplication | Many identical requests that miss at the same instant each call the provider and each store an entry, before the first has finished. The answers are correct and the duplicates are harmless, but the first burst is not de-duplicated |
 | Tracing | Per-request cost and latency are in the ledger, but there are no OpenTelemetry spans to join up with the rest of your system |
 | Mid-stream resume | A stream that dies after the first token stays dead. Failover only works before the first token, and the event ids needed to do better are in place but nothing reads them yet |
-| Shared breakers | Circuit state is per process. Several replicas each learn from their own traffic rather than from each other |
+| Shared breakers, shared cache | Circuit state and the SQLite cache are per process. Several replicas each learn from their own traffic; the Pinecone backend shares the cache across replicas, the SQLite one does not |
 
 ---
 
@@ -710,8 +771,11 @@ building this: a budget that overshot its ceiling by 650% under concurrency
 while every test passed, a dashboard that showed stale numbers as if they were
 live once the gateway died, a benchmark that measured its own instrument, a CI
 matrix that would have tested one Python version four times, a circuit breaker
-that could never recover because ``0.0`` is falsy, and a feature flag that only
-half turned its feature off.
+that could never recover because ``0.0`` is falsy, a feature flag that only
+half turned its feature off, an allow-list that a route could fail over straight
+past, a cache that billed its own hits, an expiry clock that meant nothing after
+a restart, and a lexical embedder whose false hits the bench found before a user
+could.
 
 None of them were found by the suite going red. All of them were found by
 looking on purpose.

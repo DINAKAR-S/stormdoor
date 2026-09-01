@@ -28,7 +28,11 @@ dependencies = [
 anthropic = ["anthropic>=0.40"]
 openai = ["openai>=1.55"]
 redis = ["redis>=5.2"]
-all = ["anthropic>=0.40", "openai>=1.55", "redis>=5.2"]
+# The semantic cache runs on SQLite with a local embedder and needs none of
+# these. Pinecone is the opt-in vector backend for scale; real embeddings reuse
+# the openai extra.
+pinecone = ["pinecone>=5.0"]
+all = ["anthropic>=0.40", "openai>=1.55", "redis>=5.2", "pinecone>=5.0"]
 dev = [
   "pytest>=8.3",
   "pytest-asyncio>=0.24",

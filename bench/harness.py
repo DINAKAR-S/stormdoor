@@ -67,6 +67,37 @@ FAILOVER_REQUESTS = 300
 FAILOVER_ROUTES = {"resilient": {"targets": ["echo-small", "echo-large"]}}
 FAILOVER_PRIMARY = "echo/echo-small"
 
+# The cache drill replays a realistic traffic mix: a set of distinct questions,
+# most asked more than once, which is what a support endpoint or a docs assistant
+# actually sees. The questions are lexically varied on purpose. Prompts that
+# differ by a single token are the pathological case for the local hashed
+# embedder and would show up as false hits; real questions do not look like that,
+# and the README states the limit for the case that does.
+CACHE_QUESTIONS = [
+    "how do I rotate an API key",
+    "what happens when my budget runs out",
+    "does the gateway support streaming responses",
+    "how is a rate limit reported to the caller",
+    "can I use my own OpenAI compatible endpoint",
+    "what is a virtual key and how do I make one",
+    "how do I set a per key spending cap",
+    "which models can this gateway route to",
+    "how do I enable failover between providers",
+    "what does the circuit breaker actually do",
+    "how do I turn on the semantic cache",
+    "is my prompt data sent anywhere I did not configure",
+    "how do I redact personal information from prompts",
+    "what happens to a request during a provider outage",
+    "how do I read the usage ledger for one key",
+    "can I run this without Docker or Postgres",
+    "how do I self host the dashboard behind nginx",
+    "what timezone are the spend by day figures in",
+    "how do I invalidate the cache after a docs change",
+    "why was my request refused with a 402",
+]
+CACHE_REQUESTS = 200
+CACHE_DISTINCT = len(CACHE_QUESTIONS)  # each asked once to warm, the rest repeat
+
 
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -539,6 +570,64 @@ class Bench:
         return result
 
 
+    async def cache(self, workdir: Path) -> Result:
+        """What the semantic cache is worth, in hits and in money not spent.
+
+        A deterministic traffic mix, not random, so the number is reproducible:
+        CACHE_DISTINCT unique questions, each asked once to warm the cache, then
+        the remainder of CACHE_REQUESTS drawn as repeats. Every repeat is a hit
+        that never reaches a provider and never spends a cent.
+        """
+        pricing_file = workdir / "cache-pricing.json"
+        pricing_file.write_text(json.dumps(PRICING), encoding="utf-8")
+        app = create_app(Settings(
+            db_path=workdir / "cache.db", admin_token="bench",
+            pricing_file=pricing_file, cache_enabled=True, _env_file=None,
+        ))
+        key, secret = await app.state.store.create_key(name="cache")
+        headers = {"Authorization": f"Bearer {secret}"}
+
+        # A fixed sequence: the first CACHE_DISTINCT are the unique warm-up, the
+        # rest cycle back through them. index % CACHE_DISTINCT is a repeat.
+        async with AsyncClient(transport=ASGITransport(app=app),
+                               base_url="http://bench.local", timeout=60.0) as client:
+            hits = 0
+            for i in range(CACHE_REQUESTS):
+                q = CACHE_QUESTIONS[i % CACHE_DISTINCT]
+                r = await client.post("/v1/chat/completions",
+                                      json=body(messages=[{"role": "user", "content": q}],
+                                                max_tokens=32), headers=headers)
+                if r.json()["stormdoor"]["cache"]["hit"]:
+                    hits += 1
+
+        stats = app.state.cache.stats()
+        totals = await app.state.store.totals()
+        repeats = CACHE_REQUESTS - CACHE_DISTINCT
+        app.state.store.close()
+
+        result = Result("What the semantic cache saves")
+        result.add("Requests", CACHE_REQUESTS)
+        result.add("Distinct questions", CACHE_DISTINCT)
+        result.add("Repeats (could hit)", repeats)
+        result.add("Hits", hits)
+        result.add("Hit ratio", f"{stats['hit_ratio']:.1%}")
+        result.add("Spent (only the misses)", f"${totals['cost_usd']:.4f}")
+        result.check("every repeat was a hit", hits == repeats)
+        result.check("only the distinct questions reached a provider",
+                     stats["lookups"] == CACHE_REQUESTS and stats["hits"] == repeats)
+        result.note = (
+            "The cache pays for itself on the first repeat. Here every question after "
+            "the first of its kind is served without a provider call and billed at "
+            f"nothing, so {hits} of {CACHE_REQUESTS} requests cost zero. The embedder in "
+            "this drill is the local lexical one, which needs no key; a real embedding "
+            "model would also collapse paraphrases the lexical one misses, at the cost of "
+            "an embedding call per lookup. A too-low similarity floor would trade this hit "
+            "rate for the risk of serving a subtly different answer, which is why the floor "
+            "defaults high."
+        )
+        return result
+
+
 def render(results: list[Result]) -> str:
     lines: list[str] = []
     lines.append(
@@ -609,6 +698,7 @@ async def main() -> int:
                 await bench.budget(),
                 await bench.limits(),
                 await bench.failover(Path(tmp)),
+                await bench.cache(Path(tmp)),
             ]
 
     section = render(results)

@@ -97,6 +97,62 @@ class Settings(BaseSettings):
     # A per-request header overrides it.
     chaos_default: str | None = None
 
+    # ── semantic cache ────────────────────────────────────────────────────
+    # Off by default: a cache changes what a caller gets back, so it is opt-in.
+    # When on, a non-streaming, deterministic (temperature 0 or unset) request
+    # whose prompt is close enough to a recent one is served from cache and never
+    # reaches a provider.
+    cache_enabled: bool = False
+
+    # How close two prompts must be to count as the same question, as a cosine
+    # similarity. High on purpose: a low floor serves a subtly-different answer as
+    # if it were fresh. This is the one knob that trades hit rate against that risk.
+    cache_similarity_floor: float = 0.95
+
+    # How long a cached answer stays valid, in seconds.
+    cache_ttl_s: float = 3600.0
+
+    # "sqlite" keeps vectors in the same database and searches them in process,
+    # which needs nothing and runs offline. "pinecone" is opt-in for scale and a
+    # cache shared across replicas, and needs the pinecone extra plus the two
+    # pinecone_* values below.
+    cache_backend: Literal["sqlite", "pinecone"] = "sqlite"
+
+    # The SQLite backend compares against at most this many recent entries per
+    # scope. A real bound, not an exhaustive search: past it an older cached
+    # answer is not found. Pinecone has no such bound.
+    cache_max_candidates: int = 200
+
+    # "local" is a hashed bag-of-words embedder that needs no key and runs
+    # offline; it matches wording, not meaning. "openai" is a hosted model that
+    # matches meaning and needs the openai extra plus an OpenAI key.
+    cache_embedder: Literal["local", "openai"] = "local"
+    # Width of the local embedder's vector. Wider means fewer hash collisions,
+    # and a collision is the local embedder's failure mode: two different prompts
+    # hashing to the same vector would be a false hit, serving the wrong answer.
+    # 1024 keeps that rare for realistic prompts; a real embedding model does not
+    # have this failure at all.
+    cache_embedding_dim: int = 1024
+    cache_embedding_model: str = "text-embedding-3-small"
+
+    pinecone_api_key: str | None = None
+    pinecone_index: str | None = None
+
+    # ── guardrails ────────────────────────────────────────────────────────
+    # A comma-separated, ordered chain of hooks. Empty means none, which is the
+    # exact behaviour before guardrails existed. Known hooks: pii_redact (redact
+    # PII in the prompt), pii_redact_output (redact PII in the answer),
+    # injection_flag (annotate an obvious injection attempt), injection_block
+    # (refuse one). Example: "pii_redact,injection_flag,pii_redact_output".
+    guardrail_hooks: str = ""
+
+    # Which PII shapes the redactors act on. Empty means all of: email, phone,
+    # card, ssn, ip, key.
+    guardrail_pii_kinds: str = ""
+
+    # How many distinct injection signals must fire before a flag or a block.
+    guardrail_injection_threshold: int = 1
+
     @property
     def db_url(self) -> str:
         return str(self.db_path)

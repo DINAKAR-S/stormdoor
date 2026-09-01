@@ -82,16 +82,33 @@ CREATE TABLE IF NOT EXISTS usage_records (
 );
 
 -- Small key/value table for things the gateway needs to remember about itself.
--- Currently just the generated admin token, which has to survive a restart or
--- the dashboard locks you out every time the process comes back.
+-- The generated admin token, which has to survive a restart or the dashboard
+-- locks you out every time the process comes back, and the semantic cache's
+-- cumulative lookup/hit counters so a hit ratio survives a restart.
 CREATE TABLE IF NOT EXISTS gateway_settings (
     name  TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
 
+-- The semantic cache. One row per cached answer. `scope` pins the key, model and
+-- generation parameters together so a lookup only ever compares within one
+-- tenant's own same-parameter requests; `vector` is the prompt embedding as
+-- float32 bytes; `payload` is the stored completion as JSON. `expires_ts` is a
+-- monotonic-clock deadline, so a lookup filters on it and a sweep deletes past
+-- it without parsing a timestamp.
+CREATE TABLE IF NOT EXISTS cache_entries (
+    id          TEXT PRIMARY KEY,
+    scope       TEXT NOT NULL,
+    vector      BLOB NOT NULL,
+    payload     TEXT NOT NULL,
+    created_ts  REAL NOT NULL,
+    expires_ts  REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_usage_key_ts   ON usage_records(key_id, ts);
 CREATE INDEX IF NOT EXISTS idx_usage_request  ON usage_records(request_id);
 CREATE INDEX IF NOT EXISTS idx_keys_hash      ON virtual_keys(key_hash);
+CREATE INDEX IF NOT EXISTS idx_cache_scope    ON cache_entries(scope, created_ts);
 """
 
 
@@ -376,6 +393,77 @@ class Store:
                 "ON CONFLICT(name) DO UPDATE SET value = excluded.value",
                 (name, value),
             )
+
+    # ── semantic cache ────────────────────────────────────────────────────
+    # These are synchronous on purpose: the vector store calls them inside one
+    # asyncio.to_thread hop from the gateway, so the cosine scan and the SQL run
+    # on the same worker thread and the per-thread connection is reused. Wrapping
+    # each one in its own to_thread would fan a single lookup across threads and
+    # lose that connection.
+
+    def cache_put(self, *, scope: str, vector: bytes, payload: dict,
+                  created_ts: float, expires_ts: float) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO cache_entries (id, scope, vector, payload, created_ts, expires_ts) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (f"cache_{uuid.uuid4().hex[:16]}", scope, vector,
+                 json.dumps(payload), created_ts, expires_ts),
+            )
+
+    def cache_candidates(self, *, scope: str, now: float, limit: int):
+        """The most recent unexpired entries in one scope, newest first.
+
+        The limit is the bound the SQLite backend documents: only these rows are
+        compared, so an older cached answer past the limit is not found. Ordering
+        by created_ts newest-first means the bound drops the oldest, which is the
+        least likely to still be the right answer."""
+        with self._conn() as conn:
+            return conn.execute(
+                "SELECT vector, payload FROM cache_entries "
+                "WHERE scope = ? AND expires_ts > ? "
+                "ORDER BY created_ts DESC LIMIT ?",
+                (scope, now, limit),
+            ).fetchall()
+
+    def cache_invalidate(self, *, scope: str | None = None) -> int:
+        with self._conn() as conn:
+            if scope is None:
+                cur = conn.execute("DELETE FROM cache_entries")
+            else:
+                cur = conn.execute("DELETE FROM cache_entries WHERE scope = ?", (scope,))
+            return cur.rowcount
+
+    def cache_sweep(self, *, now: float) -> int:
+        with self._conn() as conn:
+            cur = conn.execute("DELETE FROM cache_entries WHERE expires_ts <= ?", (now,))
+            return cur.rowcount
+
+    def cache_size(self) -> int:
+        with self._conn() as conn:
+            return conn.execute("SELECT COUNT(*) AS n FROM cache_entries").fetchone()["n"]
+
+    def cache_bump(self, *, hit: bool) -> None:
+        """One atomic increment of the lookup counter, and the hit counter too on
+        a hit. Kept in gateway_settings so the ratio survives a restart."""
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                for name in ("cache_lookups", "cache_hits") if hit else ("cache_lookups",):
+                    conn.execute(
+                        "INSERT INTO gateway_settings (name, value) VALUES (?, '1') "
+                        "ON CONFLICT(name) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
+                        (name,),
+                    )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+    def cache_stats(self) -> tuple[int, int]:
+        lookups = int(self.get_setting("cache_lookups") or 0)
+        hits = int(self.get_setting("cache_hits") or 0)
+        return lookups, hits
 
     def ensure_admin_token(self) -> tuple[str, bool]:
         """Return the stored admin token, creating one the first time.

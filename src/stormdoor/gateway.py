@@ -28,10 +28,11 @@ import json
 import logging
 import time
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .attempts import AttemptLog, backoff_delay
 from .breaker import CircuitBreaker
+from .cache import SemanticCache
 from .chaos import ChaosGate
 from .errors import (
     AuthError,
@@ -41,6 +42,7 @@ from .errors import (
     RateLimited,
     StormdoorError,
 )
+from .hooks import HookChain, HookNotes
 from .limits import Limiter
 from .pricing import PriceBook
 from .providers import Provider, ProviderRegistry
@@ -89,8 +91,17 @@ class Admission:
     estimated_cost_usd: float | None  # None when no candidate has a verified rate
     complexity: Complexity | None = None
     # What was claimed against the budget and must be given back when the
-    # request ends, whichever way it ends.
+    # request ends, whichever way it ends. Zero until the reservation is made,
+    # which happens only after the cache misses so a hit costs nothing.
     reserved_usd: float = 0.0
+    # The request as it should go upstream: the original, unless a guardrail
+    # rewrote it (redacted a card number out of the prompt). Everything after
+    # admission uses this, not the caller's original.
+    request: ChatCompletionRequest | None = None
+    # What the guardrails did, surfaced on the response so a redaction is never
+    # silent.
+    notes: HookNotes | None = None
+    key_id: str | None = None
 
     @property
     def first(self) -> Candidate:
@@ -108,6 +119,8 @@ class Gateway:
         prices: PriceBook,
         routes: RouteTable | None = None,
         breaker: CircuitBreaker | None = None,
+        cache: SemanticCache | None = None,
+        hooks: HookChain | None = None,
     ):
         self.settings = settings
         self.store = store
@@ -116,6 +129,8 @@ class Gateway:
         self.prices = prices
         self.routes = routes or RouteTable({})
         self.breaker = breaker or CircuitBreaker()
+        self.cache = cache
+        self.hooks = hooks or HookChain()
 
     # ── 1. authenticate ──────────────────────────────────────────────────
 
@@ -136,6 +151,15 @@ class Gateway:
     async def admit(
         self, key: VirtualKey, req: ChatCompletionRequest, *, tier_hint: str | None = None
     ) -> Admission:
+        # Guardrails run first, so everything downstream — token estimate,
+        # pricing, the prompt sent upstream, and the cache key — sees the
+        # redacted request, not the raw one. A blocking guardrail (an obvious
+        # injection) raises here and is recorded as a refusal, the same as any
+        # other admission failure. Redaction rewrites the request; the rest of
+        # the path uses `req` below, which is now the effective one.
+        notes = HookNotes()
+        req = self.hooks.on_request(req, notes)
+
         complexity = None
         route = self.routes.get(req.model)
         if route is not None and route.strategy == "complexity":
@@ -207,32 +231,47 @@ class Gateway:
         known = [p for p in priced if p is not None]
         estimate = max(known) if known else None
 
-        # Claim the worst case atomically before the call, rather than comparing
-        # against a spend figure other in-flight requests are about to change.
-        # See Store.reserve for why a read-then-decide let a $0.20 key spend $1.50.
-        reserved = 0.0
-        if key.budget_usd is not None and estimate is not None:
-            granted, spent, committed = await self.store.reserve(key.id, estimate)
-            if not granted:
-                raise BudgetExceeded(
-                    f"this request could cost up to ${estimate:.4f}, which would take "
-                    f"key {key.name!r} past its ${key.budget_usd:.2f} budget "
-                    f"(${spent:.4f} spent, ${committed - spent:.4f} reserved by requests "
-                    f"already in flight)",
-                    spent_usd=spent,
-                    budget_usd=key.budget_usd,
-                    estimate_usd=estimate,
-                )
-            reserved = estimate
-
+        # Note: the budget is not reserved here. Reservation is deferred to
+        # reserve_budget(), called only once the cache has missed, so a cache hit
+        # never touches the budget. Rate limits above are not deferred: a hit
+        # still consumes rate-limit quota, because a limiter is abuse protection
+        # and a flood of cache hits is still a flood, but it costs no money.
         return Admission(
             candidates=candidates,
             prompt_tokens_estimate=prompt_tokens,
             max_output_tokens=max_output,
             estimated_cost_usd=estimate,
             complexity=complexity,
-            reserved_usd=reserved,
+            reserved_usd=0.0,
+            request=req,
+            notes=notes,
+            key_id=key.id,
         )
+
+    async def reserve_budget(self, key: VirtualKey, admission: Admission) -> None:
+        """Claim the worst-case cost atomically, just before the upstream call.
+
+        Split out of admit so it runs only on a cache miss. The atomic claim is
+        the fix for the check-then-act race that let a $0.20 key spend $1.50: see
+        Store.reserve. Idempotent per admission — it sets reserved_usd, and a
+        second call would double-reserve, so it is called exactly once on the
+        miss path.
+        """
+        estimate = admission.estimated_cost_usd
+        if key.budget_usd is None or estimate is None:
+            return
+        granted, spent, committed = await self.store.reserve(key.id, estimate)
+        if not granted:
+            raise BudgetExceeded(
+                f"this request could cost up to ${estimate:.4f}, which would take "
+                f"key {key.name!r} past its ${key.budget_usd:.2f} budget "
+                f"(${spent:.4f} spent, ${committed - spent:.4f} reserved by requests "
+                f"already in flight)",
+                spent_usd=spent,
+                budget_usd=key.budget_usd,
+                estimate_usd=estimate,
+            )
+        admission.reserved_usd = estimate
 
     # ── 8. ledger ────────────────────────────────────────────────────────
 
@@ -249,10 +288,19 @@ class Gateway:
         error_code: str | None = None,
         reservation: float = 0.0,
         log: AttemptLog | None = None,
+        billed: bool = True,
     ) -> float:
-        cost, priced = self.prices.cost_usd(
-            model, usage.input_tokens, usage.output_tokens, usage.cached_input_tokens
-        )
+        # A cache hit records its real token counts for transparency but is not
+        # billed: the model was never called, so pricing those tokens again would
+        # charge twice for one answer. `billed=False` forces the cost to zero and
+        # marks it priced, so the "no verified rate" warning does not fire on a
+        # free row.
+        if billed:
+            cost, priced = self.prices.cost_usd(
+                model, usage.input_tokens, usage.output_tokens, usage.cached_input_tokens
+            )
+        else:
+            cost, priced = 0.0, True
         trail = log or AttemptLog()
         await self.store.record_usage(
             key_id=key.id,
@@ -385,6 +433,38 @@ class Gateway:
             retryable=True,
         )
 
+    # ── the cache, in front of the call ──────────────────────────────────
+
+    async def cache_lookup(
+        self, key: VirtualKey, admission: Admission, ctx: RequestContext
+    ) -> dict | None:
+        """A hit returns a finished response body and records it; a miss is None.
+
+        Runs after admission (so the allow-list, rate limits and guardrails have
+        already applied) and before any budget reservation (so a hit costs
+        nothing). The cache uses wall-clock time for expiry, not the monotonic
+        clock the breaker uses, because cache rows outlive the process and a
+        monotonic timestamp means nothing after a restart.
+        """
+        if self.cache is None or not self.cache.enabled:
+            return None
+        req = admission.request
+        hit = await asyncio.to_thread(
+            self.cache.lookup, admission.key_id, req, now=time.time()
+        )
+        if hit is None:
+            return None
+        ctx.mark_first_token()
+        await self._record(
+            key=key, ctx=ctx, model=hit.completion.model, provider="cache",
+            usage=hit.completion.usage, status="cache_hit", streamed=False,
+            reservation=0.0, log=AttemptLog(), billed=False,
+        )
+        body = _completion_body(req, hit.completion, 0.0, ctx, AttemptLog())
+        body["stormdoor"]["cache"] = {"hit": True, "similarity": round(hit.similarity, 4)}
+        _attach_notes(body, admission.notes)
+        return body
+
     async def complete(
         self,
         key: VirtualKey,
@@ -395,6 +475,8 @@ class Gateway:
     ) -> dict:
         ctx.chaos_fault = chaos.label
         log = AttemptLog()
+        req = admission.request or req
+        notes = admission.notes or HookNotes()
 
         try:
             target, result = await self._run_chain(req, admission, chaos, log)
@@ -408,12 +490,25 @@ class Gateway:
             raise
 
         ctx.mark_first_token()
+        # Output guardrails run on the answer before it is billed, cached or
+        # returned, so a redacted response is what the caller sees and what the
+        # cache stores. Storing the raw answer would leave PII sitting in the
+        # cache to be served again later.
+        result = replace(result, text=self.hooks.on_response(result.text, notes))
         cost = await self._record(
             key=key, ctx=ctx, model=result.model, provider=target.provider.name,
             usage=result.usage, status="ok", streamed=False,
             reservation=admission.reserved_usd, log=log,
         )
-        return _completion_body(req, result, cost, ctx, log)
+        if self.cache is not None and self.cache.enabled:
+            await asyncio.to_thread(
+                self.cache.store, admission.key_id, req, result, now=time.time()
+            )
+        body = _completion_body(req, result, cost, ctx, log)
+        if self.cache is not None and self.cache.cacheable(req):
+            body["stormdoor"]["cache"] = {"hit": False}
+        _attach_notes(body, notes)
+        return body
 
     async def _open_stream(
         self,
@@ -516,9 +611,19 @@ class Gateway:
         It is sent as an SSE ``error`` event and recorded as ``aborted`` rather
         than ``error``, because the caller did receive part of an answer and was
         charged for the tokens that were really produced.
+
+        Guardrails on a stream are split: input hooks (redaction, injection
+        blocking) already ran in admission, so the prompt sent upstream is the
+        redacted one. Output redaction runs per delta as chunks arrive, because
+        buffering the whole stream to filter it would defeat streaming. The one
+        gap that leaves — a PII token split across two deltas slipping through —
+        is stated in the README. The semantic cache does not apply to streams at
+        all, also stated: replaying a stream from cache is a separate feature.
         """
         ctx.chaos_fault = chaos.label
         log = AttemptLog()
+        req = admission.request or req
+        notes = admission.notes or HookNotes()
         cid = completion_id()
         created = int(time.time())
         index = 0
@@ -560,7 +665,8 @@ class Gateway:
                     text_seen += 1
                     if chaos.should_abort_stream(text_seen):
                         raise chaos.abort_error()
-                    yield frame(_chunk(cid, created, model_used, delta={"content": event.text}))
+                    piece = self.hooks.on_response(event.text, notes)
+                    yield frame(_chunk(cid, created, model_used, delta={"content": piece}))
                 elif isinstance(event, StreamDone):
                     usage = event.usage
                     model_used = event.model
@@ -631,3 +737,13 @@ def _completion_body(
             **trail.public(),
         },
     }
+
+
+def _attach_notes(body: dict, notes: HookNotes | None) -> None:
+    """Surface what the guardrails did on the response, so a redaction is
+    auditable rather than a silent change to the answer."""
+    if notes is None:
+        return
+    public = notes.public()
+    if public is not None:
+        body["stormdoor"]["guardrails"] = public

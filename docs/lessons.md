@@ -241,6 +241,75 @@ built the exact config from the docstring found it on the first request.
 
 ---
 
+## 15. The cache billed its own hits
+
+The cache exists to make a repeated question free. The first end-to-end budget
+test found it charging full price for every hit.
+
+The ledger-writing helper priced whatever token counts it was handed. A cache hit
+carried the original answer's real token counts, for transparency on the
+dashboard, so the helper dutifully priced them again. The model was never called
+and the money was charged anyway, which is the exact opposite of what a cache is
+for.
+
+The fix was a `billed=False` path that records the tokens but forces the cost to
+zero. The test that caught it did not check the cache; it checked the budget, and
+asserted that the key's spend after a hit equalled its spend before.
+
+> A number that is correct for display is not automatically correct for billing.
+> Decide, per field, whether it is a fact to show or a figure to charge, because
+> the same tokens are both.
+
+---
+
+## 16. A persisted deadline cannot use a monotonic clock
+
+The breaker measures its cooldown with `time.monotonic()`, which is right: a
+monotonic clock never jumps and is immune to the wall clock being adjusted. The
+cache copied that instinct for its TTL, and it was wrong, because a cache row
+outlives the process that wrote it.
+
+`monotonic()` counts from an arbitrary zero that resets every time the process
+starts. A deadline of `monotonic() + 3600`, written to disk and read back by the
+next process, is compared against a clock that has just restarted near zero: every
+entry looks either immortal or already dead, depending on which way the reset
+fell. The breaker never hit this because its state lives only in memory.
+
+The cache uses `time.time()`. A ship-gate probe that wrote an entry, closed the
+store, reopened it and checked the entry was still valid caught it.
+
+> In-memory state may use a monotonic clock. Anything written to disk must use a
+> wall clock, because the reader is a different process with a different zero.
+
+---
+
+## 17. The benchmark found the false hit before a user could
+
+The local cache embedder hashes words into a fixed-width vector. The cache drill,
+written to report a hit ratio, reported more hits than there were repeats. Two
+prompts that were supposed to be distinct had collided into the same vector and
+served each other's answers.
+
+The drill's first prompts differed by a single token ("question number 7" versus
+"question number 23"), which is the pathological case for feature hashing: one
+differing token against two shared ones, and if that token collides in the hash,
+the vectors are identical and the cosine is a perfect, wrong, 1.0. The floor
+cannot save you, because the score is 1.0.
+
+Two honest responses, not one. The default vector width went up, which makes a
+collision rare for realistic prompts. And the limit is stated in the README
+rather than hidden, because a lexical embedder that can, occasionally, serve the
+wrong answer is a real property a reader deserves to know before turning the cache
+on. The drill itself was changed to use realistically varied prompts, because
+single-token-apart questions are not what real traffic looks like and a benchmark
+should measure the real case while the docs cover the adversarial one.
+
+> A cache that matches approximately can match wrongly. Measure the failure, put
+> a number on how rare it is, state it, and give the reader the exact knob that
+> trades it away.
+
+---
+
 ## The rule underneath all of these
 
 The test suite proves the code does what you thought of. Something else has to
