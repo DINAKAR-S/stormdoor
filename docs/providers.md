@@ -31,6 +31,75 @@ uv pip install 'stormdoor[all]'         # everything
 `echo-small` needs none of this and works offline, which is why the quickstart
 uses it.
 
+## A full walkthrough with OpenAI, one key per project
+
+From a fresh clone to three projects each calling OpenAI through stormdoor with
+its own budget.
+
+**1. Clone and install with OpenAI support.**
+
+```bash
+git clone https://github.com/DINAKAR-S/stormdoor && cd stormdoor
+uv venv && uv pip install -e ".[dev,openai]"
+```
+
+**2. Add your real OpenAI key.** This is the one and only place it lives. Your
+apps never see it.
+
+```bash
+# .env
+STORMDOOR_OPENAI_API_KEY=sk-proj-your-real-openai-key
+```
+
+**3. Start the gateway and get the dashboard token.**
+
+```bash
+uv run stormdoor serve
+uv run stormdoor admin-token     # the token to sign into http://localhost:8080
+```
+
+**4. Make one virtual key per project.** These are stormdoor keys (`sd-...`), not
+your OpenAI key. Do it in the dashboard's **New key** panel, or from the CLI:
+
+```bash
+uv run stormdoor keys create billing-app    --budget 50 --rpm 300
+uv run stormdoor keys create support-bot     --budget 20 --rpm 120
+uv run stormdoor keys create nightly-report  --budget 5  --rpm 30
+```
+
+Each prints a different `sd-...` secret once. Give each project its own, so a
+leak or an overspend is contained to that one project.
+
+**5. Point each app at stormdoor.** Two lines change; ask for a real OpenAI model.
+
+```python
+from openai import OpenAI
+client = OpenAI(
+    base_url="http://localhost:8080/v1",   # was https://api.openai.com/v1
+    api_key="sd-...",                      # this project's sd- key from step 4
+)
+client.chat.completions.create(
+    model="gpt-4o-mini",
+    messages=[{"role": "user", "content": "hello"}],
+)
+```
+
+**6. Watch and manage it.** The dashboard's Keys table lists every key with its
+budget and spend; the cost report breaks spend down by key, provider or model
+over any date range. `uv run stormdoor keys list` is the same view from the CLI.
+When `nightly-report` hits its $5 it starts returning 402s and stops, while the
+other two keep working.
+
+### Two questions this raises
+
+- **Do I have to use the CLI to make per-project keys?** No. The dashboard's
+  **New key** button and `stormdoor keys create` do the same thing; use either.
+- **Where does the OpenAI key go, UI or CLI?** Neither. The real provider key is a
+  server environment variable (`.env`), read once at startup. Only the virtual
+  `sd-...` keys are created through the UI or the CLI. stormdoor holds one real
+  key and issues many virtual ones; it is not a store of many secrets. If you
+  want that, use a vault, which is a separate tool.
+
 ## OpenAI
 
 ```bash
