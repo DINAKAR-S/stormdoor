@@ -164,6 +164,8 @@ async def test_export_endpoint_returns_totals_and_providers(app_c):
     body = r.json()
     assert body["total_requests"] == 3
     assert body["total_cost_usd"] >= 0
+    assert body["total_tokens"] == sum(x["total_tokens"] for x in body["rows"])
+    assert body["total_tokens"] > 0
     assert "echo" in body["providers"]
 
 

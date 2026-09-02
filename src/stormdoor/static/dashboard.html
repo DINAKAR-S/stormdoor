@@ -366,6 +366,13 @@
         <div class="body" id="new-key-panel" hidden>
           <div id="secret-notice" class="notice secret" hidden></div>
 
+          <p class="sub" style="margin:0 0 16px">
+            You do not paste a provider key here. This creates a stormdoor key
+            (<code>sd-...</code>) for one app to use. Your real OpenAI or Anthropic
+            key is set once on the server (<code>STORMDOOR_OPENAI_API_KEY</code>),
+            and stormdoor uses it to make the actual call.
+          </p>
+
           <label style="margin-bottom:8px">How should this key behave</label>
           <div class="seg" role="group" aria-label="Key mode" style="margin-bottom:14px">
             <button type="button" id="mode-watch" aria-pressed="true">Track spend only</button>
@@ -1136,13 +1143,16 @@ function renderReport(r, group, date, date2) {
   el("rep-out").innerHTML =
     `<div class="sub" style="margin-bottom:12px">${when}${scope}</div>` +
     `<table class="rep-table"><thead><tr><th>${head}</th>` +
-    `<th class="num">Requests</th><th class="num">Cost</th></tr></thead><tbody>` +
+    `<th class="num">Requests</th><th class="num">Tokens</th>` +
+    `<th class="num">Cost</th></tr></thead><tbody>` +
     rows.map((x) =>
       `<tr><td>${esc(x.label)}${
         x.cache_hits ? ` <span class="rep-cache">(${fmtInt(x.cache_hits)} free from cache)</span>` : ""
       }</td><td class="num">${fmtInt(x.requests)}</td>` +
+      `<td class="num">${fmtInt(x.total_tokens)}</td>` +
       `<td class="num">${fmtMoney(x.cost_usd)}</td></tr>`).join("") +
     `<tr class="rep-total"><td>Total</td><td class="num">${fmtInt(r.total_requests)}</td>` +
+    `<td class="num">${fmtInt(r.total_tokens)}</td>` +
     `<td class="num">${fmtMoney(r.total_cost_usd)}</td></tr>` +
     `</tbody></table>`;
 }

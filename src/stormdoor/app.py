@@ -504,9 +504,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                                         provider=provider)
         total = round(sum(r["cost_usd"] for r in rows), 8)
         total_requests = sum(r["requests"] for r in rows)
+        total_tokens = sum(r["total_tokens"] for r in rows)
         return {"group_by": group_by, "since": since, "until": until,
                 "provider": provider, "providers": registry.names(),
-                "rows": rows, "total_cost_usd": total, "total_requests": total_requests}
+                "rows": rows, "total_cost_usd": total, "total_requests": total_requests,
+                "total_tokens": total_tokens}
 
     @app.post("/admin/usage/push", dependencies=[Depends(_require_admin)])
     async def usage_push(since: str | None = None, until: str | None = None) -> dict:
