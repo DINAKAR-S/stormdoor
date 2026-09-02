@@ -17,13 +17,12 @@ nobody tests, because provoking a real 503 or a real mid-stream disconnect is
 inconvenient. So stormdoor injects them for you, and every reliability claim in
 this README is produced by a harness in `bench/` that you can rerun.
 
-> **Status: week 4 of a public build, and honest about it.** What works and is tested: providers,
-> streaming, virtual keys, budgets, rate limits, fault injection, the ledger, the
-> dashboard, routing with retries, circuit breaking and failover, a semantic cache,
-> guardrail hooks for PII redaction and prompt-injection filtering, OpenTelemetry
-> tracing, usage metering with a Stripe export, and resuming a dropped stream from
-> its last event id. The honest limits on each are stated plainly. See the
-> [build log](#build-log) and [what is not built yet](#what-is-not-built-yet).
+> **Status: the four-week build is complete and live, and this page is honest about it.** What works
+> and is tested: providers, streaming, virtual keys, budgets, rate limits, fault injection, the ledger,
+> the dashboard, routing with retries, circuit breaking and failover, a semantic cache, guardrail hooks
+> for PII redaction and prompt-injection filtering, OpenTelemetry tracing, usage metering with a Stripe
+> export, and resuming a dropped stream from its last event id. The honest limits on each are stated
+> plainly. See the [build log](#build-log) and [what is not built yet](#what-is-not-built-yet).
 
 > **Pointing an AI agent at this repo?** Give it [`AGENTS.md`](AGENTS.md) instead
 > of this whole page: a dense, one-screen guide to what stormdoor is, the key
