@@ -147,6 +147,75 @@ uv run stormdoor keys usage <key_id>
 
 ---
 
+## How to use it with your own provider, step by step
+
+The sixty-second demo above uses the built-in local `echo` model, so it needs no
+key. Here is the same thing with a real provider, in order.
+
+**1. Install, with the provider you want.**
+
+```bash
+git clone https://github.com/DINAKAR-S/stormdoor && cd stormdoor
+uv venv && uv pip install -e ".[dev,openai]"     # or [dev,anthropic], or [dev,all]
+```
+
+**2. Add your real provider key.** This is the one and only place it lives. Put it
+in a `.env` file next to the gateway (or export it). Your apps never see it.
+
+```bash
+# .env
+STORMDOOR_OPENAI_API_KEY=sk-proj-your-real-openai-key
+```
+
+More providers (Claude, a local vLLM or Ollama) are in
+[docs/providers.md](docs/providers.md).
+
+**3. Start the gateway.**
+
+```bash
+uv run stormdoor serve
+```
+
+Open [localhost:8080](http://localhost:8080) and sign in with the admin token
+(`uv run stormdoor admin-token`).
+
+**4. Make a key for an app, with a budget.** This is a stormdoor **virtual key**
+(`sd-...`), not your provider key. In the dashboard click **New key**, set a name
+and a budget, and copy the `sd-...` it gives you once. Or from the CLI:
+
+```bash
+uv run stormdoor keys create my-app --budget 25 --rpm 120
+```
+
+**5. Point your app at stormdoor.** Change two lines. Any OpenAI SDK works.
+
+```python
+from openai import OpenAI
+client = OpenAI(
+    base_url="http://localhost:8080/v1",   # was https://api.openai.com/v1
+    api_key="sd-...",                      # the stormdoor key from step 4
+)
+client.chat.completions.create(
+    model="gpt-4o-mini",                   # a real provider model now
+    messages=[{"role": "user", "content": "hello"}],
+)
+```
+
+**6. Watch it in the dashboard.** Every request shows up in the ledger with its
+cost, the key spends against its budget, and the cost report lets you pick a day,
+a month or a custom range and break spend down by key, provider or model. When a
+key hits its budget it starts returning 402s and stops, while every other key
+keeps working.
+
+**7. (Optional) rehearse the bad day.** Start with `--chaos`, then use the
+dashboard's fault panel, or send an `X-Stormdoor-Chaos` header, to make a provider
+fail on purpose and watch your app cope before it happens for real.
+
+That is the whole loop: **one real key on the server, one `sd-...` key per app, and
+a dashboard that shows and controls what each app spends.**
+
+---
+
 ## Why this exists
 
 A gateway is bought for what it does on the bad day. Yet the normal way to gain
