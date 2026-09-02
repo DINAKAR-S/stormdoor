@@ -505,7 +505,9 @@ on somebody else's server. Send the id and it routes.
 
 ## Configuration
 
-Everything takes a `STORMDOOR_` prefix, and `.env` is read if present.
+Everything takes a `STORMDOOR_` prefix, and `.env` is read if present. For
+copy-paste `.env` examples for OpenAI, Claude and a local vLLM or Ollama, see
+[docs/providers.md](docs/providers.md).
 
 | Variable | Default | What it does |
 |---|---|---|

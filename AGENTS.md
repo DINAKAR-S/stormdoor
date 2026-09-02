@@ -77,7 +77,9 @@ client.chat.completions.create(model="echo-small",
 
 For a real provider, set the provider key on the stormdoor server once
 (`STORMDOOR_OPENAI_API_KEY=sk-...`) and ask for that provider's model (e.g.
-`gpt-4o-mini`). The app still only ever holds the `sd-...` key.
+`gpt-4o-mini`). The app still only ever holds the `sd-...` key. Copy-paste `.env`
+examples for OpenAI, Claude and a local vLLM or Ollama are in
+[`docs/providers.md`](docs/providers.md).
 
 ## Features, each in one line
 
