@@ -104,6 +104,81 @@ async def test_export_endpoint_validates_group_by(app_c):
     assert r.status_code == 400
 
 
+# ── report: group by provider / model, filter by provider, date windows ────────
+
+
+async def _mix(c, secret):
+    """A spread across both echo models so provider/model grouping has content."""
+    h = {"Authorization": f"Bearer {secret}"}
+    for model in ("echo-small", "echo-small", "echo-large"):
+        await c.post("/v1/chat/completions",
+                     json={"model": model, "messages": [{"role": "user", "content": "hi"}],
+                           "max_tokens": 32}, headers=h)
+
+
+async def test_export_groups_by_model(app_c):
+    app, c = app_c
+    _k, s = await app.state.store.create_key(name="a")
+    await _mix(c, s)
+    rows = await app.state.store.usage_export(group_by="model")
+    by_model = {r["model"]: r for r in rows}
+    assert by_model["echo-small"]["requests"] == 2
+    assert by_model["echo-large"]["requests"] == 1
+    # Every row carries a human label for the report table.
+    assert all("label" in r for r in rows)
+
+
+async def test_export_groups_by_provider(app_c):
+    app, c = app_c
+    _k, s = await app.state.store.create_key(name="a")
+    await _mix(c, s)
+    rows = await app.state.store.usage_export(group_by="provider")
+    assert [r["provider"] for r in rows] == ["echo"]
+    assert rows[0]["requests"] == 3
+
+
+async def test_export_filters_by_provider(app_c):
+    app, c = app_c
+    _k, s = await app.state.store.create_key(name="a")
+    await _mix(c, s)
+    kept = await app.state.store.usage_export(group_by="key", provider="echo")
+    assert kept and kept[0]["requests"] == 3
+    dropped = await app.state.store.usage_export(group_by="key", provider="openai")
+    assert dropped == [], "a provider filter that matches nothing returns nothing"
+
+
+async def test_export_endpoint_rejects_unknown_provider(app_c):
+    _app, c = app_c
+    r = await c.get("/admin/usage/export?provider=openai",
+                    headers={"X-Stormdoor-Admin": "admin"})
+    assert r.status_code == 400
+    assert r.json()["error"]["param"] == "provider"
+
+
+async def test_export_endpoint_returns_totals_and_providers(app_c):
+    app, c = app_c
+    _k, s = await app.state.store.create_key(name="a")
+    await _mix(c, s)
+    r = await c.get("/admin/usage/export?group_by=provider",
+                    headers={"X-Stormdoor-Admin": "admin"})
+    body = r.json()
+    assert body["total_requests"] == 3
+    assert body["total_cost_usd"] >= 0
+    assert "echo" in body["providers"]
+
+
+async def test_export_day_window_excludes_out_of_range(app_c):
+    app, c = app_c
+    _k, s = await app.state.store.create_key(name="a")
+    await _mix(c, s)
+    # Everything was written "now", so a window entirely in the future is empty
+    # and one covering all time keeps it.
+    future = await app.state.store.usage_export(since="2999-01-01", until="2999-01-02")
+    assert future == []
+    allrows = await app.state.store.usage_export(since="2000-01-01")
+    assert allrows and allrows[0]["requests"] == 3
+
+
 # ── push ─────────────────────────────────────────────────────────────────────
 
 

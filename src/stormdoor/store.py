@@ -494,15 +494,33 @@ class Store:
 
     # ── metering / usage export ───────────────────────────────────────────
 
+    # What each grouping selects and what the row's id field is called. The id
+    # field name is kept stable (`key_id`, `tenant`, ...) so existing callers do
+    # not break; a `label` is added for display.
+    _EXPORT_GROUPS = {
+        "key": ("u.key_id", "key_id"),
+        "tenant": ("k.tenant", "tenant"),
+        "provider": ("u.provider", "provider"),
+        "model": ("u.model", "model"),
+    }
+
     def _usage_export(self, *, since: str | None, until: str | None,
-                      group_by: str) -> list[dict]:
+                      group_by: str, provider: str | None = None) -> list[dict]:
         # Only real spend counts toward a bill: refusals and pure errors produced
         # no tokens and cost nothing, so they are excluded here even though they
         # stay in the ledger. A cache hit is billed at zero and is likewise not a
         # charge, but its tokens are real usage, so it is counted in the token
         # totals and contributes $0 to cost, which is the honest picture.
-        grp = "k.tenant" if group_by == "tenant" else "u.key_id"
-        label = "tenant" if group_by == "tenant" else "key_id"
+        if group_by not in self._EXPORT_GROUPS:
+            raise ValueError(
+                f"unknown group_by {group_by!r}, expected one of "
+                f"{list(self._EXPORT_GROUPS)}"
+            )
+        col, id_field = self._EXPORT_GROUPS[group_by]
+        # For a key grouping the readable label is the key's name; for the others
+        # the group value is already readable, so it is its own label.
+        label_sql = "MAX(k.name)" if group_by == "key" else f"MAX({col})"
+
         where = ["u.status IN ('ok', 'cache_hit')"]
         params: list = []
         if since is not None:
@@ -511,10 +529,14 @@ class Store:
         if until is not None:
             where.append("u.ts < ?")
             params.append(until)
+        if provider is not None:
+            where.append("u.provider = ?")
+            params.append(provider)
         clause = " AND ".join(where)
         with self._conn() as conn:
             rows = conn.execute(
-                f"""SELECT {grp} AS grp,
+                f"""SELECT {col} AS grp,
+                          {label_sql} AS label,
                           COUNT(*)                         AS requests,
                           COALESCE(SUM(u.input_tokens), 0)  AS input_tokens,
                           COALESCE(SUM(u.output_tokens), 0) AS output_tokens,
@@ -529,7 +551,8 @@ class Store:
             ).fetchall()
         return [
             {
-                label: r["grp"],
+                id_field: r["grp"],
+                "label": r["label"] if r["label"] is not None else r["grp"],
                 "requests": r["requests"],
                 "input_tokens": r["input_tokens"],
                 "output_tokens": r["output_tokens"],
@@ -541,9 +564,10 @@ class Store:
         ]
 
     async def usage_export(self, *, since: str | None = None, until: str | None = None,
-                           group_by: str = "key") -> list[dict]:
+                           group_by: str = "key", provider: str | None = None) -> list[dict]:
         return await asyncio.to_thread(
-            self._usage_export, since=since, until=until, group_by=group_by
+            self._usage_export, since=since, until=until, group_by=group_by,
+            provider=provider,
         )
 
     def _metering_reserve(self, *, period_key: str, sink: str) -> bool:

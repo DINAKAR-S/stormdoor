@@ -480,20 +480,33 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/admin/usage/export", dependencies=[Depends(_require_admin)])
     async def usage_export(since: str | None = None, until: str | None = None,
-                           group_by: str = "key") -> dict:
-        """Usage rolled up for billing, over a window, grouped by key or tenant.
+                           group_by: str = "key", provider: str | None = None) -> dict:
+        """Usage rolled up over a window, grouped and optionally filtered.
 
         Needs no external service: this is the ledger aggregated, which is what a
-        billing job wants to read. `since` and `until` are ISO timestamps compared
-        against the ledger's own; omit them for all time.
+        billing job or a report wants to read. `since` and `until` are ISO
+        timestamps compared against the ledger's own; omit them for all time. Pass
+        one day as `since=DAY&until=<next day>` for a single-day report, or a
+        month's bounds for a monthly one. `group_by` is key, tenant, provider or
+        model. `provider` narrows it to one upstream (e.g. only OpenAI).
         """
-        if group_by not in ("key", "tenant"):
-            raise BadRequest("group_by must be 'key' or 'tenant'", param="group_by")
-        for label, value in (("since", since), ("until", until)):
+        if group_by not in ("key", "tenant", "provider", "model"):
+            raise BadRequest(
+                "group_by must be key, tenant, provider or model", param="group_by")
+        for name, value in (("since", since), ("until", until)):
             if value is not None and not _TS.match(value):
-                raise BadRequest(f"{label} must be an ISO timestamp", param=label)
-        rows = await store.usage_export(since=since, until=until, group_by=group_by)
-        return {"group_by": group_by, "since": since, "until": until, "rows": rows}
+                raise BadRequest(f"{name} must be an ISO timestamp", param=name)
+        if provider is not None and provider not in registry.names():
+            raise BadRequest(
+                f"unknown provider {provider!r}; known: {registry.names()}",
+                param="provider")
+        rows = await store.usage_export(since=since, until=until, group_by=group_by,
+                                        provider=provider)
+        total = round(sum(r["cost_usd"] for r in rows), 8)
+        total_requests = sum(r["requests"] for r in rows)
+        return {"group_by": group_by, "since": since, "until": until,
+                "provider": provider, "providers": registry.names(),
+                "rows": rows, "total_cost_usd": total, "total_requests": total_requests}
 
     @app.post("/admin/usage/push", dependencies=[Depends(_require_admin)])
     async def usage_push(since: str | None = None, until: str | None = None) -> dict:

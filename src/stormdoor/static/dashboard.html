@@ -143,9 +143,12 @@
                      font-family:var(--mono); }
 
   /* ── spend by day ──────────────────────────────────────── */
-  .daychart { display:flex; align-items:flex-end; gap:3px; height:140px; }
-  .daybar { flex:1 1 auto; min-height:0; height:100%; padding:0; min-width:0;
-            background:transparent; border:0; border-radius:4px; cursor:pointer;
+  .daychart { display:flex; align-items:flex-end; justify-content:flex-start;
+              gap:4px; height:140px; }
+  /* Each day is capped so a single day reads as one bar, not a wall filling the
+     whole card; a full month of bars shrinks to fit rather than overflowing. */
+  .daybar { flex:0 1 46px; max-width:46px; min-width:6px; min-height:0; height:100%;
+            padding:0; background:transparent; border:0; border-radius:4px; cursor:pointer;
             display:flex; align-items:flex-end; transition:background .18s var(--out); }
   .daybar:hover { background:var(--panel-2); }
   .daybar .fill { display:block; width:100%; border-radius:4px 4px 2px 2px;
@@ -161,6 +164,30 @@
   .daybar:focus-visible { outline:2px solid var(--magenta); outline-offset:2px; }
   .dayaxis { display:flex; justify-content:space-between; margin-top:8px;
              font-family:var(--mono); font-size:.68rem; color:var(--ink-3); }
+
+  /* ── cost report ──────────────────────────────────────── */
+  .report-controls { display:flex; flex-wrap:wrap; gap:14px 18px; align-items:flex-end;
+                     margin-bottom:18px; }
+  .report-controls label { display:flex; flex-direction:column; gap:6px;
+                           font-family:var(--mono); font-size:.66rem; letter-spacing:.06em;
+                           text-transform:uppercase; color:var(--ink-3); }
+  .report-controls input, .report-controls select {
+      background:var(--panel-2); color:var(--ink); border:1px solid var(--line);
+      border-radius:8px; padding:8px 11px; font-size:.9rem; font-family:inherit;
+      color-scheme:dark; }
+  .report-controls input:focus-visible, .report-controls select:focus-visible {
+      outline:2px solid var(--magenta); outline-offset:1px; }
+  .rep-table { width:100%; border-collapse:collapse; font-size:.92rem; }
+  .rep-table th { text-align:left; font-family:var(--mono); font-size:.66rem;
+                  letter-spacing:.06em; text-transform:uppercase; color:var(--ink-3);
+                  padding:7px 10px; border-bottom:1px solid var(--line); }
+  .rep-table th.num, .rep-table td.num { text-align:right;
+                  font-variant-numeric:tabular-nums; font-family:var(--mono); }
+  .rep-table td { padding:9px 10px; border-bottom:1px solid var(--panel-2); }
+  .rep-table tr:last-child td { border-bottom:0; }
+  .rep-table .rep-total td { border-top:1px solid var(--line); font-weight:700;
+                             color:var(--magenta-2); }
+  .rep-cache { color:var(--ink-3); font-size:.72rem; font-family:var(--mono); }
 
   /* ── provider health ──────────────────────────────────── */
   .targets { display:flex; flex-direction:column; gap:12px; }
@@ -294,6 +321,39 @@
       </div>
     </div>
     <div class="body" id="spend-days"><div class="empty">No spend recorded yet</div></div>
+  </div>
+
+  <div class="card">
+    <div class="head">
+      <div><h2>Cost report</h2>
+      <div class="sub">Pick a day or a whole month, then break it down or filter it.</div></div>
+    </div>
+    <div class="body">
+      <div class="report-controls">
+        <div class="seg" id="rep-range" role="group" aria-label="Range" style="width:auto">
+          <button type="button" data-range="day" aria-pressed="true">That day</button>
+          <button type="button" data-range="month" aria-pressed="false">That month</button>
+          <button type="button" data-range="custom" aria-pressed="false">Custom</button>
+        </div>
+        <label id="rep-date-wrap"><span id="rep-date-label">Date</span>
+          <input type="date" id="rep-date">
+        </label>
+        <label id="rep-date2-wrap" hidden>To
+          <input type="date" id="rep-date2">
+        </label>
+        <label>Provider
+          <select id="rep-provider"><option value="">All providers</option></select>
+        </label>
+        <label>Break down by
+          <select id="rep-group">
+            <option value="key">Key</option>
+            <option value="provider">Provider</option>
+            <option value="model">Model</option>
+          </select>
+        </label>
+      </div>
+      <div id="rep-out"><div class="empty">Pick a date to see the report.</div></div>
+    </div>
   </div>
 
   <div class="cols">
@@ -610,14 +670,13 @@ function renderSpendDays(payload) {
   }
   const max = Math.max(...days.map((d) => d.cost_usd), 1e-9);
   const peak = payload.peak ? payload.peak.day : null;
-  const w = 100 / days.length;
 
   const bars = days.map((d) => {
     const h = Math.max(2, (d.cost_usd / max) * 100);
     const isPeak = d.day === peak;
     const isPicked = d.day === selectedDay;
     return `<button class="daybar${isPeak ? " peak" : ""}${isPicked ? " picked" : ""}"
-        style="width:${w}%" data-day="${esc(d.day)}"
+        data-day="${esc(d.day)}"
         title="${esc(d.day)}: ${fmtMoney(d.cost_usd)} over ${fmtInt(d.requests)} request(s)"
         aria-label="${esc(d.day)}, ${fmtMoney(d.cost_usd)}, ${fmtInt(d.requests)} requests">
         <span class="fill" style="height:${h.toFixed(1)}%"></span>
@@ -661,6 +720,13 @@ function pickDay(day) {
   el("ledger-sub").textContent = selectedDay
     ? `Only requests from ${selectedDay}`
     : "Every request, including the ones turned away";
+  // Clicking a day in the chart also points the cost report at that day, so
+  // "what did that spike cost, and who spent it" is one click.
+  if (selectedDay && typeof loadReport === "function") {
+    el("rep-date").value = selectedDay;
+    setRepRange("day");
+    loadReport();
+  }
   refresh();
 }
 
@@ -981,10 +1047,120 @@ el("reset-breakers").addEventListener("click", async () => {
 el("d-fault").addEventListener("change", syncDrillFields);
 el("d-run").addEventListener("click", runDrill);
 
+// ── cost report ────────────────────────────────────────────────────────────
+
+let repRange = "day";
+
+function isoToday() {
+  const d = new Date();
+  return new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate())).toISOString().slice(0, 10);
+}
+function isoNextDay(iso) {
+  const d = new Date(iso + "T00:00:00Z");
+  d.setUTCDate(d.getUTCDate() + 1);
+  return d.toISOString().slice(0, 10);
+}
+function isoMonthBounds(iso) {
+  const d = new Date(iso + "T00:00:00Z");
+  const s = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1));
+  const e = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1));
+  return [s.toISOString().slice(0, 10), e.toISOString().slice(0, 10)];
+}
+function setRepRange(r) {
+  repRange = r;
+  document.querySelectorAll("#rep-range [data-range]").forEach((b) =>
+    b.setAttribute("aria-pressed", String(b.dataset.range === r)));
+  // A custom range needs a second date and a "From" label; the presets need
+  // neither, so those are hidden rather than left to confuse.
+  el("rep-date2-wrap").hidden = r !== "custom";
+  el("rep-date-label").textContent = r === "custom" ? "From" : "Date";
+  if (r === "custom" && !el("rep-date2").value) el("rep-date2").value = el("rep-date").value;
+}
+function fillProviders(list) {
+  const sel = el("rep-provider");
+  const have = new Set([...sel.options].map((o) => o.value));
+  (list || []).forEach((p) => {
+    if (!have.has(p)) {
+      const o = document.createElement("option");
+      o.value = p; o.textContent = p; sel.appendChild(o);
+    }
+  });
+}
+function fmtDay(iso) {
+  return new Date(iso + "T00:00:00Z")
+    .toLocaleDateString(undefined, { month: "long", day: "numeric", year: "numeric" });
+}
+function repWhen(date, date2) {
+  if (repRange === "month") {
+    return new Date(date + "T00:00:00Z")
+      .toLocaleDateString(undefined, { month: "long", year: "numeric" });
+  }
+  if (repRange === "custom") return `${fmtDay(date)} to ${fmtDay(date2 || date)}`;
+  return fmtDay(date);
+}
+
+async function loadReport() {
+  const date = el("rep-date").value || isoToday();
+  const date2 = el("rep-date2").value || date;
+  let since, until;
+  if (repRange === "month") { [since, until] = isoMonthBounds(date); }
+  else if (repRange === "custom") {
+    // Inclusive of both ends: until is the day after the "To" date so its whole
+    // day is counted. If the user picked them backwards, swap so it still works.
+    const lo = date <= date2 ? date : date2, hi = date <= date2 ? date2 : date;
+    since = lo; until = isoNextDay(hi);
+  } else { since = date; until = isoNextDay(date); }
+  const provider = el("rep-provider").value;
+  const group = el("rep-group").value;
+  const q = new URLSearchParams({ since, until, group_by: group });
+  if (provider) q.set("provider", provider);
+  try {
+    const r = await api("/admin/usage/export?" + q.toString());
+    fillProviders(r.providers);
+    renderReport(r, group, date, date2);
+  } catch (err) {
+    el("rep-out").innerHTML = `<div class="notice err">${esc(err.message)}</div>`;
+  }
+}
+
+function renderReport(r, group, date, date2) {
+  const rows = r.rows || [];
+  const head = group === "provider" ? "Provider" : group === "model" ? "Model" : "Key";
+  const scope = el("rep-provider").value ? ` &middot; only ${esc(el("rep-provider").value)}` : "";
+  const when = esc(repWhen(date, date2));
+  if (!rows.length) {
+    el("rep-out").innerHTML =
+      `<div class="empty">Nothing was spent on ${when}${scope}.</div>`;
+    return;
+  }
+  el("rep-out").innerHTML =
+    `<div class="sub" style="margin-bottom:12px">${when}${scope}</div>` +
+    `<table class="rep-table"><thead><tr><th>${head}</th>` +
+    `<th class="num">Requests</th><th class="num">Cost</th></tr></thead><tbody>` +
+    rows.map((x) =>
+      `<tr><td>${esc(x.label)}${
+        x.cache_hits ? ` <span class="rep-cache">(${fmtInt(x.cache_hits)} free from cache)</span>` : ""
+      }</td><td class="num">${fmtInt(x.requests)}</td>` +
+      `<td class="num">${fmtMoney(x.cost_usd)}</td></tr>`).join("") +
+    `<tr class="rep-total"><td>Total</td><td class="num">${fmtInt(r.total_requests)}</td>` +
+    `<td class="num">${fmtMoney(r.total_cost_usd)}</td></tr>` +
+    `</tbody></table>`;
+}
+
+el("rep-date").addEventListener("change", loadReport);
+el("rep-date2").addEventListener("change", loadReport);
+el("rep-provider").addEventListener("change", loadReport);
+el("rep-group").addEventListener("change", loadReport);
+document.querySelectorAll("#rep-range [data-range]").forEach((btn) => {
+  btn.addEventListener("click", () => { setRepRange(btn.dataset.range); loadReport(); });
+});
+
 syncDrillFields();
 setMode(false);
 if (readToken()) {
-  refresh().then(start).catch((err) =>
+  el("rep-date").value = isoToday();
+  el("rep-date2").value = isoToday();
+  refresh().then(() => { loadReport(); start(); }).catch((err) =>
     showGate(err.status === 401 ? "That token was not accepted." : err.message));
 } else {
   showGate("");

@@ -25,6 +25,11 @@ this README is produced by a harness in `bench/` that you can rerun.
 > its last event id. The honest limits on each are stated plainly. See the
 > [build log](#build-log) and [what is not built yet](#what-is-not-built-yet).
 
+> **Pointing an AI agent at this repo?** Give it [`AGENTS.md`](AGENTS.md) instead
+> of this whole page: a dense, one-screen guide to what stormdoor is, the key
+> mental model, how to set it up, and every feature, written for an assistant to
+> read and answer questions from.
+
 ![The stormdoor dashboard: gateway counters and spend by day, with the most expensive day called out](https://raw.githubusercontent.com/DINAKAR-S/stormdoor/main/docs/screenshots/dashboard.png)
 
 Every request that goes through the gateway, what it cost, and which day cost
